@@ -94,6 +94,7 @@ extern uintptr SignalStackBase();
 // From rsrc_patches.cpp
 extern "C" void check_load_invoc(uint32 type, int16 id, uint32 h);
 extern "C" void named_check_load_invoc(uint32 type, uint32 name, uint32 h);
+extern uint32 USBUIMCall(uint32 slot, uint32 toc, uint32 ret, uint32 a1, uint32 a2, uint32 a3, uint32 a4, uint32 a5, uint32 a6, uint32 a7, uint32 a8);
 
 // PowerPC EmulOp to exit from emulation loop
 const uint32 POWERPC_EXEC_RETURN = POWERPC_EMUL_OP | 1;
@@ -1072,6 +1073,9 @@ void sheepshaver_cpu::execute_native_op(uint32 selector)
 		break;
 	case NATIVE_VIDEO_DO_DRIVER_IO:
 		gpr(3) = (int32)(int16)VideoDoDriverIO(gpr(3), gpr(4), gpr(5), gpr(6), gpr(7));
+		break;
+	case NATIVE_USB_UIM:			// USB UIM stub: slot number in r11, UIM TOC in r2, arguments in r3-r10
+		gpr(3) = USBUIMCall(gpr(11), gpr(2), lr(), gpr(3), gpr(4), gpr(5), gpr(6), gpr(7), gpr(8), gpr(9), gpr(10));
 		break;
 	case NATIVE_ETHER_AO_GET_HWADDR:
 		AO_get_ethernet_address(gpr(3));

@@ -252,6 +252,11 @@ bool InitAll(const char *vmdir)
 	WriteMacInt32(XLM_ETHER_WPUT, NativeFunction(NATIVE_ETHER_WPUT));
 	WriteMacInt32(XLM_ETHER_RSRV, NativeFunction(NATIVE_ETHER_RSRV));
 	WriteMacInt32(XLM_VIDEO_DOIO, NativeFunction(NATIVE_VIDEO_DO_DRIVER_IO));
+#if EMULATED_PPC
+	WriteMacInt32(XLM_USB_UIM, NativeFunction(NATIVE_USB_UIM));	// USB UIM dispatcher
+#else
+	WriteMacInt32(XLM_USB_UIM, 0);	// needs r11, only available with the PPC emulator
+#endif
 	D(bug("Low Memory initialized\n"));
 
 #if ENABLE_MON

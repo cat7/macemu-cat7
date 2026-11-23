@@ -51,6 +51,7 @@ prefs_desc common_prefs_items[] = {
 	{"nocdrom", TYPE_BOOLEAN, false,    "don't install CD-ROM driver"},
 	{"nonet", TYPE_BOOLEAN, false,      "don't use Ethernet"},
 	{"nosound", TYPE_BOOLEAN, false,    "don't enable sound output"},
+	{"usbuim", TYPE_BOOLEAN, false,     "install the experimental USB UIM (logs to usb.log)"},
 	{"nogui", TYPE_BOOLEAN, false,      "disable GUI"},
 	{"noclipconversion", TYPE_BOOLEAN, false, "don't convert clipboard contents"},
 	{"ignoresegv", TYPE_BOOLEAN, false, "ignore illegal memory accesses"},
@@ -95,6 +96,7 @@ void AddPrefsDefaults(void)
 	PrefsAddBool("nocdrom", false);
 	PrefsAddBool("nonet", false);
 	PrefsAddBool("nosound", false);
+	PrefsAddBool("usbuim", false);
 	PrefsAddInt32("soundingain", 100);
 	PrefsAddBool("nogui", false);
 	PrefsAddBool("noclipconversion", false);
