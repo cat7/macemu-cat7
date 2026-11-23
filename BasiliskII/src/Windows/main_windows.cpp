@@ -26,8 +26,6 @@
 #include <errno.h>
 
 #include "my_sdl.h"
-#include <SDL_mutex.h>
-#include <SDL_thread.h>
 
 #include <string>
 typedef std::basic_string<TCHAR> tstring;
@@ -648,9 +646,7 @@ static int tick_func(void *arg)
  */
 
 #ifdef USE_SDL_VIDEO
-#if SDL_VERSION_ATLEAST(3, 0, 0)
-#include <SDL_video.h>
-#else
+#if !SDL_VERSION_ATLEAST(3, 0, 0)
 #include <SDL_syswm.h>
 #endif
 extern SDL_Window *sdl_window;
@@ -661,7 +657,7 @@ HWND GetMainWindowHandle(void)
 	}
 #if SDL_VERSION_ATLEAST(3, 0, 0)
 	SDL_PropertiesID props = SDL_GetWindowProperties(sdl_window);
-	return (HWND)SDL_GetPointerProperty(props, "SDL.window.cocoa.window", NULL);
+	return (HWND)SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL);
 #else
 	SDL_SysWMinfo wmInfo;
 	SDL_VERSION(&wmInfo.version);

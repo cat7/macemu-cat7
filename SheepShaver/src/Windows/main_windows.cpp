@@ -837,7 +837,7 @@ HWND GetMainWindowHandle(void)
 	}
 #if SDL_VERSION_ATLEAST(3, 0, 0)
 	SDL_PropertiesID props = SDL_GetWindowProperties(sdl_window);
-	return (HWND)SDL_GetPointerProperty(props, "SDL.window.cocoa.window", NULL);
+	return (HWND)SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL);
 #else
 	SDL_SysWMinfo wmInfo;
 	SDL_VERSION(&wmInfo.version);
