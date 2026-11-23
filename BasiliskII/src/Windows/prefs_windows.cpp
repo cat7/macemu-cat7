@@ -49,6 +49,11 @@ prefs_desc platform_prefs_items[] = {
 	{"tcp_port", TYPE_STRING, false,                "TCP ports list"},
 	{"portfile0", TYPE_STRING, false,               "output file for serial port 0"},
 	{"portfile1", TYPE_STRING, false,               "output file for serial port 1"},
+	{"midiout0", TYPE_STRING, false,                "MIDI output device for serial port 0 set to MIDI (number or name)"},
+	{"midiout1", TYPE_STRING, false,                "MIDI output device for serial port 1 set to MIDI (number or name)"},
+	{"midiin0", TYPE_STRING, false,                 "MIDI input device for serial port 0 set to MIDI (number, name or none)"},
+	{"midiin1", TYPE_STRING, false,                 "MIDI input device for serial port 1 set to MIDI (number, name or none)"},
+	{"debugserial", TYPE_INT32, false,             "serial debug log (serial.log): 0=off, 1=normal, 2=loud"},
 #ifdef USE_SDL_VIDEO
 	{"sdlrender", TYPE_STRING, false,      "SDL_Renderer driver (\"auto\", \"software\" (may be faster), etc.)"},
 	{"sdl_vsync", TYPE_BOOLEAN, false,     "Make SDL_Renderer vertical sync frames to host (eg. with software renderer)"},

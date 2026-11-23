@@ -41,7 +41,7 @@ CPPFLAGS = @CPPFLAGS@ -I../include -I. -I../slirp
 DEFS = @DEFS@
 LDFLAGS = @LDFLAGS@ -Wl,-Bstatic
 #TODO remove pthread part of that if irrelevant
-LIBS = @LIBS@ -lws2_32 -lwsock32 -liphlpapi
+LIBS = @LIBS@ -lws2_32 -lwsock32 -liphlpapi -lwinmm
 CPUSRCS = @CPUSRCS@
 EXTRASRCS = @EXTRASRCS@
 PERL = @PERL@

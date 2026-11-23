@@ -28,6 +28,7 @@
 
 #include "main.h"
 #include "util_windows.h"
+#include <mmsystem.h>
 // somehow util_windows undefines min
 #define min(x,y) ((x) < (y) ? (x) : (y))
 #include "macos_util.h"
@@ -45,6 +46,26 @@ static void serial_log_write( char *s );
 #include "debug.h"
 #undef D
 #define D(x) if(debug_serial != DB_SERIAL_NONE) (x);
+
+// debug.h's bug() goes to OutputDebugStringA, which the define above does
+// not catch, so serial.log stayed empty. Route bug() to the log file.
+static void serial_bug(const char *s, ...)
+{
+	char msg[1024];
+	struct _timeb tstruct;
+	_ftime(&tstruct);
+	char hours[50];
+	_strtime(hours);
+	int n = _snprintf(msg, sizeof(msg), "%s.%03u ", hours, tstruct.millitm);
+	va_list vargs;
+	va_start(vargs, s);
+	_vsnprintf(msg + n, sizeof(msg) - n - 1, s, vargs);
+	va_end(vargs);
+	msg[sizeof(msg) - 1] = 0;
+	serial_log_write(msg);
+}
+#undef bug
+#define bug serial_bug
 
 
 enum {
@@ -135,15 +156,39 @@ public:
 			}
 		}
 
-		is_serial = !is_parallel && !is_file;
+		is_midi = (_tcsncmp(device_name, TEXT("MIDI"), 4) == 0);
+		if(is_midi) {
+			char entry_name[20];
+			_snprintf( entry_name, lengthof(entry_name), "midiout%s", str(suffix).get() );
+			midi_out_spec = PrefsFindString(entry_name);
+			_snprintf( entry_name, lengthof(entry_name), "midiin%s", str(suffix).get() );
+			midi_in_spec = PrefsFindString(entry_name);
+		} else {
+			midi_out_spec = midi_in_spec = NULL;
+		}
+
+		is_serial = !is_parallel && !is_file && !is_midi;
 
 		fd = INVALID_HANDLE_VALUE;
 		input_thread_active = output_thread_active = NULL;
+
+		midi_out = NULL;
+		midi_in = NULL;
+		midi_in_thread = NULL;
+		midi_in_event = NULL;
+		midi_in_ready = NULL;
+		midi_in_closing = false;
+		midi_in_head = midi_in_count = 0;
+		midi_in_overflow = 0;
+		InitializeCriticalSection(&midi_in_lock);
+		midi_reset_parser();
   }
 
   virtual ~XSERDPort()
   {
 		D(bug("XSERDPort destructor \r\n"));
+		if (is_midi)
+			midi_close();
 		if (input_thread_active) {
 			D(bug("WARNING: brute TerminateThread(input)\r\n"));
 			TerminateThread(input_thread_active,0);
@@ -196,6 +241,47 @@ private:
 
 	bool is_file;									// true if FILE
 	TCHAR output_file_name[256];
+
+	// MIDI port: Mac serial byte stream <-> Windows MIDI devices (winmm)
+	bool is_midi;									// true if MIDI
+	const char *midi_out_spec;		// "midiout0/1" pref: device number or name substring
+	const char *midi_in_spec;			// "midiin0/1" pref: device number, name substring, or "none"
+	HMIDIOUT midi_out;
+	HMIDIIN midi_in;
+
+	bool midi_open(void);
+	void midi_close(void);
+	void midi_write(const uint8 *buf, uint32 length);
+	void midi_reset_parser(void);
+	void midi_send_sysex(void);
+	uint32 midi_in_available(void);
+	uint32 midi_in_read(uint8 *buf, uint32 length);
+	void midi_in_purge(void);
+	void midi_in_push(const uint8 *buf, uint32 length);
+	static unsigned int WINAPI midi_in_func(void *arg);
+
+	// Output parser state
+	uint8 midi_status;						// running status (0 = none)
+	uint8 midi_data[2];
+	int midi_data_count;
+	int midi_data_needed;
+	bool midi_in_sysex;
+	uint8 midi_sysex_buf[65536];
+	uint32 midi_sysex_len;
+
+	// Input: callback thread fills a ring buffer that input_func drains
+	enum { MIDI_IN_RING_SIZE = 65536, MIDI_IN_SYSEX_BUFS = 4, MIDI_IN_SYSEX_SIZE = 4096 };
+	HANDLE midi_in_thread;
+	unsigned int midi_in_thread_id;
+	HANDLE midi_in_event;					// signalled when bytes are added to the ring
+	HANDLE midi_in_ready;					// input thread has its message queue
+	CRITICAL_SECTION midi_in_lock;
+	uint8 midi_in_ring[MIDI_IN_RING_SIZE];
+	uint32 midi_in_head, midi_in_count;
+	uint32 midi_in_overflow;			// bytes dropped because the ring was full
+	MIDIHDR midi_in_hdr[MIDI_IN_SYSEX_BUFS];
+	char midi_in_sysex_data[MIDI_IN_SYSEX_BUFS][MIDI_IN_SYSEX_SIZE];
+	volatile bool midi_in_closing;
 };
 
 /*
@@ -258,7 +344,10 @@ int16 XSERDPort::open(uint16 config)
 	quitting = false;
 
 	// Open port
-	if(is_file) {
+	if(is_midi) {
+		if(!midi_open())
+			goto open_error;
+	} else if(is_file) {
 		DeleteFile( output_file_name );
 		fd = CreateFile( output_file_name,
 			GENERIC_READ | GENERIC_WRITE,
@@ -268,9 +357,9 @@ int16 XSERDPort::open(uint16 config)
 	} else {
 		fd = CreateFile( device_name, GENERIC_READ|GENERIC_WRITE, 0, 0, OPEN_EXISTING, 0, 0 );
 	}
-	if(fd == INVALID_HANDLE_VALUE) {
-		goto open_error;
+	if(!is_midi && fd == INVALID_HANDLE_VALUE) {
 		D(bug(TEXT("XSERDPort::open failed to open port %s\r\n"),device_name));
+		goto open_error;
 	}
 
 	if(is_serial) {
@@ -321,8 +410,10 @@ open_error:
 	}
 	if(fd != INVALID_HANDLE_VALUE) {
 		CloseHandle(fd);
-		fd = 0;
+		fd = INVALID_HANDLE_VALUE;
 	}
+	if(is_midi)
+		midi_close();
 	return openErr;
 }
 
@@ -387,7 +478,9 @@ int16 XSERDPort::control(uint32 pb, uint32 dce, uint16 code)
 			 data bits, and one stop bit. This makes a total of 10 bits
 			 for each 320 microsecond period per serial byte.
 			*/
-			D(bug("kSERDClockMIDI setting 38400,n,8,1\n"));
+			// For a MIDI port the clock is irrelevant. For a COM port the rate
+			// is left unchanged, as before (see the disabled code below).
+			D(bug("kSERDClockMIDI (external MIDI clock requested)\n"));
 			return noErr;
 
 			/*
@@ -411,7 +504,19 @@ int16 XSERDPort::control(uint32 pb, uint32 dce, uint16 code)
 		case 1:			// KillIO
 			io_killed = true;
 
-			if(is_serial) {
+			if(is_midi) {
+				// A blocked MIDI read polls io_killed; wait for it to bail out
+				SetEvent(midi_in_event);
+				DWORD endtime = GetTickCount() + 1000;
+				while ( (read_pending || write_pending) && (GetTickCount() < endtime) ) {
+					Sleep(5);
+				}
+				if(read_pending || write_pending) {
+					D(bug("Warning (KillIO): read_pending=%d, write_pending=%d\n", read_pending, write_pending));
+					read_pending = write_pending = false;
+				}
+				midi_in_purge();
+			} else if(is_serial) {
 				// Make sure we won't hang waiting. There is something wrong
 				// in how read_pending & write_pending are handled.
 				DWORD endtime = GetTickCount() + 1000;
@@ -564,7 +669,10 @@ int16 XSERDPort::control(uint32 pb, uint32 dce, uint16 code)
 			}
 
 		case kSERDResetChannel:
-			if (is_serial) {
+			if (is_midi) {
+				midi_in_purge();
+				midi_reset_parser();
+			} else if (is_serial) {
 				// | PURGE_TXABORT | PURGE_RXABORT not needed, no overlapped i/o
 				PurgeComm(fd,PURGE_TXCLEAR|PURGE_RXCLEAR);
 				FlushFileBuffers(fd);
@@ -620,7 +728,9 @@ int16 XSERDPort::status(uint32 pb, uint32 dce, uint16 code)
 	switch (code) {
 		case kSERDInputCount: {
 			uint32 num = 0;
-			if (is_serial) {
+			if (is_midi) {
+				num = midi_in_available();
+			} else if (is_serial) {
 				if(!ClearCommError(fd,&error_state,&comstat)) return statusErr;
 				num = comstat.cbInQue;
 			}
@@ -638,7 +748,7 @@ int16 XSERDPort::status(uint32 pb, uint32 dce, uint16 code)
 				if(!GetCommModemStatus(fd,&status)) return statusErr;
 			} else {
 				status = MS_CTS_ON | MS_DSR_ON | MS_RLSD_ON;
-				D(bug("kSERDStatus: faking status for LPT port or FILE\r\n"));
+				D(bug("kSERDStatus: faking status for LPT port, FILE or MIDI\r\n"));
 			}
 
 			WriteMacInt8(p + staXOffSent, 0);
@@ -690,8 +800,10 @@ int16 XSERDPort::close()
 	// Close port
 	if(fd != INVALID_HANDLE_VALUE) {
 		CloseHandle(fd);
-		fd = 0;
+		fd = INVALID_HANDLE_VALUE;
 	}
+	if(is_midi)
+		midi_close();
   return noErr;
 }
 
@@ -1027,11 +1139,394 @@ static void dump_dirst_bytes( BYTE *buf, int32 actual )
 	}
 	b[i] = 0;
 	strcat((char*)b,"\r\n");
-	D(bug((char*)b));
+	D(bug("%s", (char*)b));
 }
 #else
 #define dump_dirst_bytes(b,a) {}
 #endif
+
+
+/*
+ *  MIDI port ("seriala MIDI" / "serialb MIDI")
+ *
+ *  The Mac side sees an ordinary serial port. Bytes written to it are
+ *  parsed into MIDI messages and sent to a Windows MIDI output device;
+ *  messages from a Windows MIDI input device are turned back into a byte
+ *  stream for the Mac. Baud rate and clock settings are ignored.
+ *
+ *  Prefs (N = 0 for seriala, 1 for serialb):
+ *    midioutN <number | name substring>   default: MIDI mapper
+ *    midiinN  <number | name substring | none>   default: device 0, if any
+ */
+
+static void midi_log_bytes(const char *what, const uint8 *buf, uint32 length)
+{
+	if(debug_serial == DB_SERIAL_NONE) return;
+
+	char line[16 + 32 * 3 + 8];
+	int pos = _snprintf(line, sizeof(line), "%s %lu:", what, (unsigned long)length);
+	for (uint32 i = 0; i < length && i < 32; i++)
+		pos += _snprintf(line + pos, sizeof(line) - pos, " %02X", buf[i]);
+	_snprintf(line + pos, sizeof(line) - pos, "%s\r\n", length > 32 ? " ..." : "");
+	D(bug("%s", line));
+}
+
+// Returns a device index, or -1 when nothing matches
+static int midi_find_device(const char *spec, bool output)
+{
+	UINT n = output ? midiOutGetNumDevs() : midiInGetNumDevs();
+	char *end;
+	long index = strtol(spec, &end, 10);
+	if (*spec && *end == 0)
+		return (index >= 0 && (UINT)index < n) ? (int)index : -1;
+
+	for (UINT i = 0; i < n; i++) {
+		char name[MAXPNAMELEN];
+		if (output) {
+			MIDIOUTCAPSA caps;
+			if (midiOutGetDevCapsA(i, &caps, sizeof(caps)) != MMSYSERR_NOERROR) continue;
+			strcpy(name, caps.szPname);
+		} else {
+			MIDIINCAPSA caps;
+			if (midiInGetDevCapsA(i, &caps, sizeof(caps)) != MMSYSERR_NOERROR) continue;
+			strcpy(name, caps.szPname);
+		}
+		char a[MAXPNAMELEN], b[256];
+		strncpy(a, name, sizeof(a)); a[sizeof(a) - 1] = 0; _strlwr(a);
+		strncpy(b, spec, sizeof(b)); b[sizeof(b) - 1] = 0; _strlwr(b);
+		if (strstr(a, b))
+			return (int)i;
+	}
+	return -1;
+}
+
+static void midi_log_devices(void)
+{
+	if(debug_serial == DB_SERIAL_NONE) return;
+
+	for (UINT i = 0; i < midiOutGetNumDevs(); i++) {
+		MIDIOUTCAPSA caps;
+		if (midiOutGetDevCapsA(i, &caps, sizeof(caps)) == MMSYSERR_NOERROR)
+			D(bug("MIDI out %u: %s\r\n", i, caps.szPname));
+	}
+	for (UINT i = 0; i < midiInGetNumDevs(); i++) {
+		MIDIINCAPSA caps;
+		if (midiInGetDevCapsA(i, &caps, sizeof(caps)) == MMSYSERR_NOERROR)
+			D(bug("MIDI in %u: %s\r\n", i, caps.szPname));
+	}
+}
+
+bool XSERDPort::midi_open(void)
+{
+	midi_log_devices();
+
+	// Output
+	UINT out_id = MIDI_MAPPER;
+	if (midi_out_spec && *midi_out_spec) {
+		int i = midi_find_device(midi_out_spec, true);
+		if (i < 0) {
+			D(bug("MIDI out device \"%s\" not found\r\n", midi_out_spec));
+			return false;
+		}
+		out_id = i;
+	}
+	MMRESULT r = midiOutOpen(&midi_out, out_id, 0, 0, CALLBACK_NULL);
+	if (r != MMSYSERR_NOERROR) {
+		D(bug("midiOutOpen(%d) failed, error %u\r\n", (int)out_id, r));
+		midi_out = NULL;
+		return false;
+	}
+	D(bug("MIDI out opened (device %d)\r\n", (int)out_id));
+	midi_reset_parser();
+
+	// Input (optional)
+	midi_in_purge();
+	midi_in_overflow = 0;
+	if (midi_in_spec && _stricmp(midi_in_spec, "none") == 0)
+		return true;
+	int in_id = 0;
+	if (midi_in_spec && *midi_in_spec) {
+		in_id = midi_find_device(midi_in_spec, false);
+		if (in_id < 0) {
+			D(bug("MIDI in device \"%s\" not found\r\n", midi_in_spec));
+			midi_close();
+			return false;
+		}
+	} else if (midiInGetNumDevs() == 0) {
+		D(bug("No MIDI input devices, input disabled\r\n"));
+		return true;
+	}
+
+	midi_in_event = CreateEvent(NULL, FALSE, FALSE, NULL);
+	midi_in_ready = CreateEvent(NULL, TRUE, FALSE, NULL);
+	if (!midi_in_event || !midi_in_ready) {
+		midi_close();
+		return false;
+	}
+	midi_in_closing = false;
+	midi_in_thread = (HANDLE)_beginthreadex(0, 0, midi_in_func, (LPVOID)this, 0, &midi_in_thread_id);
+	if (!midi_in_thread) {
+		midi_close();
+		return false;
+	}
+	// The thread must own a message queue before winmm posts to it
+	WaitForSingleObject(midi_in_ready, INFINITE);
+	CloseHandle(midi_in_ready);
+	midi_in_ready = NULL;
+
+	r = midiInOpen(&midi_in, in_id, midi_in_thread_id, (DWORD_PTR)this, CALLBACK_THREAD);
+	if (r != MMSYSERR_NOERROR) {
+		D(bug("midiInOpen(%d) failed, error %u\r\n", in_id, r));
+		midi_in = NULL;
+		midi_close();
+		return false;
+	}
+	for (int i = 0; i < MIDI_IN_SYSEX_BUFS; i++) {
+		memset(&midi_in_hdr[i], 0, sizeof(MIDIHDR));
+		midi_in_hdr[i].lpData = midi_in_sysex_data[i];
+		midi_in_hdr[i].dwBufferLength = MIDI_IN_SYSEX_SIZE;
+		midiInPrepareHeader(midi_in, &midi_in_hdr[i], sizeof(MIDIHDR));
+		midiInAddBuffer(midi_in, &midi_in_hdr[i], sizeof(MIDIHDR));
+	}
+	midiInStart(midi_in);
+	D(bug("MIDI in opened (device %d)\r\n", in_id));
+	return true;
+}
+
+void XSERDPort::midi_close(void)
+{
+	if (midi_in) {
+		midi_in_closing = true;
+		midiInStop(midi_in);
+		midiInReset(midi_in);	// returns pending SysEx buffers
+		for (int i = 0; i < MIDI_IN_SYSEX_BUFS; i++)
+			midiInUnprepareHeader(midi_in, &midi_in_hdr[i], sizeof(MIDIHDR));
+		midiInClose(midi_in);
+		midi_in = NULL;
+	}
+	if (midi_in_thread) {
+		PostThreadMessage(midi_in_thread_id, WM_QUIT, 0, 0);
+		WaitForSingleObject(midi_in_thread, 2000);
+		CloseHandle(midi_in_thread);
+		midi_in_thread = NULL;
+	}
+	if (midi_in_event) {
+		CloseHandle(midi_in_event);
+		midi_in_event = NULL;
+	}
+	if (midi_in_ready) {
+		CloseHandle(midi_in_ready);
+		midi_in_ready = NULL;
+	}
+	if (midi_out) {
+		midiOutReset(midi_out);
+		midiOutClose(midi_out);
+		midi_out = NULL;
+	}
+	if (midi_in_overflow) {
+		D(bug("MIDI in: %lu bytes dropped (Mac not reading)\r\n", (unsigned long)midi_in_overflow));
+	}
+}
+
+void XSERDPort::midi_reset_parser(void)
+{
+	midi_status = 0;
+	midi_data_count = 0;
+	midi_data_needed = 0;
+	midi_in_sysex = false;
+	midi_sysex_len = 0;
+}
+
+void XSERDPort::midi_send_sysex(void)
+{
+	if (midi_sysex_len == 0 || !midi_out)
+		return;
+	midi_log_bytes("MIDI out sysex", midi_sysex_buf, midi_sysex_len);
+
+	MIDIHDR hdr;
+	memset(&hdr, 0, sizeof(hdr));
+	hdr.lpData = (LPSTR)midi_sysex_buf;
+	hdr.dwBufferLength = hdr.dwBytesRecorded = midi_sysex_len;
+	if (midiOutPrepareHeader(midi_out, &hdr, sizeof(hdr)) == MMSYSERR_NOERROR) {
+		if (midiOutLongMsg(midi_out, &hdr, sizeof(hdr)) == MMSYSERR_NOERROR) {
+			DWORD endtime = GetTickCount() + 2000;
+			while (!(hdr.dwFlags & MHDR_DONE) && GetTickCount() < endtime)
+				Sleep(1);
+		}
+		midiOutUnprepareHeader(midi_out, &hdr, sizeof(hdr));
+	}
+	midi_sysex_len = 0;
+}
+
+// Number of data bytes following a status byte (-1: not a message we send)
+static int midi_data_length(uint8 status)
+{
+	if (status < 0xf0)
+		return ((status & 0xe0) == 0xc0) ? 1 : 2;	// Cn/Dn: 1, others: 2
+	switch (status) {
+		case 0xf1: case 0xf3: return 1;
+		case 0xf2: return 2;
+		case 0xf6: return 0;
+		default: return -1;
+	}
+}
+
+void XSERDPort::midi_write(const uint8 *buf, uint32 length)
+{
+	midi_log_bytes("MIDI out", buf, length);
+	if (!midi_out)
+		return;
+
+	for (uint32 i = 0; i < length; i++) {
+		uint8 b = buf[i];
+
+		if (b >= 0xf8) {
+			// Real-time: may appear anywhere, even inside SysEx
+			midiOutShortMsg(midi_out, b);
+			continue;
+		}
+
+		if (b == 0xf0) {
+			if (midi_in_sysex)
+				midi_send_sysex();
+			midi_in_sysex = true;
+			midi_status = 0;
+			midi_sysex_len = 0;
+			midi_sysex_buf[midi_sysex_len++] = b;
+			continue;
+		}
+
+		if (midi_in_sysex) {
+			if (b < 0x80) {
+				if (midi_sysex_len < sizeof(midi_sysex_buf) - 1)
+					midi_sysex_buf[midi_sysex_len++] = b;
+				continue;
+			}
+			// F7 ends SysEx; any other status byte ends it implicitly.
+			// Data stops one short of the buffer end, so F7 always fits.
+			midi_sysex_buf[midi_sysex_len++] = 0xf7;
+			midi_send_sysex();
+			midi_in_sysex = false;
+			if (b == 0xf7)
+				continue;
+		}
+
+		if (b >= 0x80) {
+			int n = midi_data_length(b);
+			if (n < 0) {				// F4, F5, stray F7: undefined, ignore
+				midi_status = 0;
+				continue;
+			}
+			midi_status = b;
+			midi_data_count = 0;
+			midi_data_needed = n;
+			if (n == 0) {				// F6 Tune Request
+				midiOutShortMsg(midi_out, b);
+				midi_status = 0;
+			}
+			continue;
+		}
+
+		// Data byte
+		if (midi_status == 0)
+			continue;					// no running status: drop
+		midi_data[midi_data_count++] = b;
+		if (midi_data_count == midi_data_needed) {
+			DWORD msg = midi_status | (midi_data[0] << 8);
+			if (midi_data_needed == 2)
+				msg |= midi_data[1] << 16;
+			midiOutShortMsg(midi_out, msg);
+			midi_data_count = 0;
+			if (midi_status >= 0xf0)	// system common cancels running status
+				midi_status = 0;
+		}
+	}
+}
+
+uint32 XSERDPort::midi_in_available(void)
+{
+	EnterCriticalSection(&midi_in_lock);
+	uint32 n = midi_in_count;
+	LeaveCriticalSection(&midi_in_lock);
+	return n;
+}
+
+uint32 XSERDPort::midi_in_read(uint8 *buf, uint32 length)
+{
+	EnterCriticalSection(&midi_in_lock);
+	uint32 n = min(length, midi_in_count);
+	for (uint32 i = 0; i < n; i++) {
+		buf[i] = midi_in_ring[midi_in_head];
+		midi_in_head = (midi_in_head + 1) % MIDI_IN_RING_SIZE;
+	}
+	midi_in_count -= n;
+	LeaveCriticalSection(&midi_in_lock);
+	return n;
+}
+
+void XSERDPort::midi_in_purge(void)
+{
+	EnterCriticalSection(&midi_in_lock);
+	midi_in_head = midi_in_count = 0;
+	LeaveCriticalSection(&midi_in_lock);
+}
+
+void XSERDPort::midi_in_push(const uint8 *buf, uint32 length)
+{
+	midi_log_bytes("MIDI in", buf, length);
+	EnterCriticalSection(&midi_in_lock);
+	for (uint32 i = 0; i < length; i++) {
+		if (midi_in_count == MIDI_IN_RING_SIZE) {
+			midi_in_overflow += length - i;
+			break;
+		}
+		midi_in_ring[(midi_in_head + midi_in_count) % MIDI_IN_RING_SIZE] = buf[i];
+		midi_in_count++;
+	}
+	LeaveCriticalSection(&midi_in_lock);
+	if (midi_in_event)
+		SetEvent(midi_in_event);
+}
+
+/*
+ *  MIDI input thread: receives winmm's CALLBACK_THREAD messages, so
+ *  SysEx buffers can be re-queued here (not allowed in a callback function)
+ */
+
+unsigned int XSERDPort::midi_in_func(void *arg)
+{
+	// One thread per port, so the port is known; winmm's thread messages
+	// don't carry the instance pointer.
+	XSERDPort *s = (XSERDPort *)arg;
+	MSG msg;
+	PeekMessage(&msg, NULL, WM_USER, WM_USER, PM_NOREMOVE);	// create the queue
+	SetEvent(s->midi_in_ready);
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+
+	while (GetMessage(&msg, NULL, 0, 0) > 0) {
+		switch (msg.message) {
+			case MM_MIM_DATA: {
+				DWORD m = (DWORD)msg.lParam;
+				uint8 bytes[3] = { (uint8)m, (uint8)(m >> 8), (uint8)(m >> 16) };
+				int n = (bytes[0] >= 0xf8) ? 0 : midi_data_length(bytes[0]);
+				if (n >= 0)
+					s->midi_in_push(bytes, n + 1);
+				break;
+			}
+			case MM_MIM_LONGDATA: {
+				HMIDIIN h = (HMIDIIN)msg.wParam;
+				MIDIHDR *hdr = (MIDIHDR *)msg.lParam;
+				if (hdr->dwBytesRecorded)
+					s->midi_in_push((const uint8 *)hdr->lpData, hdr->dwBytesRecorded);
+				if (!s->midi_in_closing)
+					midiInAddBuffer(h, hdr, sizeof(MIDIHDR));
+				break;
+			}
+		}
+	}
+	_endthreadex(0);
+	return 0;
+}
 
 /*
  *  Data input thread
@@ -1068,7 +1563,22 @@ unsigned int XSERDPort::input_func(void *arg)
 		}
 
 		int32 actual;
-		if(s->is_file) {
+		if(s->is_midi) {
+			// Mac semantics: Read completes once ioReqCount bytes have arrived
+			actual = 0;
+			while (!s->quitting && !s->io_killed) {
+				if (s->midi_in_available() >= length) {
+					actual = s->midi_in_read((uint8 *)buf, length);
+					break;
+				}
+				if (s->midi_in_event)
+					WaitForSingleObject(s->midi_in_event, 50);
+				else
+					Sleep(50);			// MIDI input disabled: nothing will arrive
+			}
+			if (s->quitting)
+				break;
+		} else if(s->is_file) {
 			actual = -1;
 			error_code = readErr;
 		} else if(!ReadFile(s->fd, buf, length, (LPDWORD)&actual, 0)) {
@@ -1153,7 +1663,10 @@ unsigned int XSERDPort::output_func(void *arg)
 		}
 
 		int32 actual;
-		if(!WriteFile(s->fd, buf, length, (LPDWORD)&actual, 0)) {
+		if(s->is_midi) {
+			s->midi_write((const uint8 *)buf, length);
+			actual = length;
+		} else if(!WriteFile(s->fd, buf, length, (LPDWORD)&actual, 0)) {
 			actual = -1;
 			if(s->is_serial)
 				error_code = acknowledge_error(s->fd,false);
