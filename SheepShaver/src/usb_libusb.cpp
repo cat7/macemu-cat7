@@ -15,8 +15,11 @@
  */
 
 /*
- *  The devices named by "usbdevice VVVV:PPPP" prefs are passed through, in
- *  pref order. A device libusb can open (on Windows: bound to WinUSB, e.g.
+ *  The devices named by "usbdevice VVVV:PPPP" prefs are passed through, one
+ *  root hub port per pref, in pref order. They may be plugged in and out
+ *  while the emulator runs: the event thread scans the device list about
+ *  once a second and reports arrivals and removals, which the emulator
+ *  thread applies (changes()). A device libusb can open (on Windows: bound to WinUSB, e.g.
  *  with winusb-switch, or a HID device) gets its control requests forwarded.
  *  A device it cannot open is served in "descriptors only" mode: the Mac
  *  gets its real device and configuration descriptors, which the host has
@@ -48,6 +51,8 @@ public:
 	virtual ~LibUSBHost();
 
 	virtual int count(void) { start(); return (int)devs.size(); }
+	virtual bool present(int dev) { start(); return valid(dev) && devs[dev].present; }
+	virtual uint32 changes(void);
 	virtual bool low_speed(int dev) { return valid(dev) && devs[dev].low_speed; }
 	virtual const char *name(int dev) { return valid(dev) ? devs[dev].label.c_str() : "?"; }
 	virtual int control(int dev, const uint8 *setup, uint8 *data, int length);
@@ -58,7 +63,9 @@ public:
 
 private:
 	struct Device {
-		libusb_device *dev;
+		unsigned vid, pid;			// from the prefs
+		bool present;
+		libusb_device *dev;			// NULL when unplugged
 		libusb_device_handle *handle;	// NULL: descriptors only
 		bool low_speed;
 		bool high_speed;			// faster than the Mac's USB 1.1 bus
@@ -67,6 +74,9 @@ private:
 
 	void start(void);
 	bool valid(int dev) { return dev >= 0 && dev < (int)devs.size(); }
+	void attach(int slot, libusb_device *dev);
+	void detach(int slot);
+	void scan(void);
 	int cached_request(Device &d, const uint8 *setup, uint8 *data, int length);
 	static int config_bytes(libusb_device *dev, int index, std::vector<uint8> &out);
 	static void clamp_bulk_packets(std::vector<uint8> &config);
@@ -81,6 +91,7 @@ private:
 	// wait in a queue until the emulator reaps them.
 	struct Pending {
 		libusb_transfer *xfer;
+		libusb_device_handle *handle;
 		int dev;
 		uint8 ep;
 		uint32 tag;
@@ -95,6 +106,16 @@ private:
 	std::deque<Done> done;
 	std::thread events;
 	std::atomic<bool> quit;
+
+	// Hotplug: the event thread's view of which device is in which slot,
+	// and the arrivals (dev) and removals (NULL) it found
+	struct Event {
+		int slot;
+		libusb_device *dev;
+	};
+	std::vector<libusb_device *> known;
+	std::deque<Event> events_found;
+	std::vector<libusb_device_handle *> closing;	// unplugged, transfers pending
 	void event_loop(void);
 	static void LIBUSB_CALL transfer_done(libusb_transfer *xfer);
 };
@@ -106,11 +127,9 @@ LibUSBHost::~LibUSBHost()
 		events.detach();		// at exit: do not wait for libusb
 		return;
 	}
-	for (size_t i = 0; i < devs.size(); i++) {
-		if (devs[i].handle)
-			libusb_close(devs[i].handle);
-		libusb_unref_device(devs[i].dev);
-	}
+	for (size_t i = 0; i < devs.size(); i++)
+		if (devs[i].present)
+			detach((int)i);
 	if (ctx)
 		libusb_exit(ctx);
 }
@@ -131,46 +150,159 @@ void LibUSBHost::start(void)
 	if (wanted.empty() || libusb_init(&ctx) != 0)
 		return;
 
+	for (size_t w = 0; w < wanted.size(); w++) {
+		Device d;
+		d.vid = wanted[w].first;
+		d.pid = wanted[w].second;
+		d.present = false;
+		d.dev = NULL;
+		d.handle = NULL;
+		devs.push_back(d);
+	}
+	known.assign(devs.size(), NULL);
+
+	// Devices plugged in now are there from the start
+	scan();
+	changes();
+
+	events = std::thread(&LibUSBHost::event_loop, this);
+}
+
+// Plug a device into a slot (emulator thread; takes over the reference)
+void LibUSBHost::attach(int slot, libusb_device *dev)
+{
+	Device &d = devs[slot];
+	d.dev = dev;
+	d.handle = NULL;
+	int speed = libusb_get_device_speed(dev);
+	d.low_speed = speed == LIBUSB_SPEED_LOW;
+	d.high_speed = speed >= LIBUSB_SPEED_HIGH;
+	if (libusb_open(dev, &d.handle) != 0)
+		d.handle = NULL;
+	char buf[64];
+	snprintf(buf, sizeof(buf), "%04x:%04x %s%s", d.vid, d.pid,
+	         d.low_speed ? "low speed" : d.high_speed ? "high speed" : "full speed",
+	         d.handle ? "" : ", descriptors only");
+	d.label = buf;
+	d.present = true;
+}
+
+// Unplug a slot's device: its transfers are cancelled, and its handle is
+// closed once none are left (emulator thread)
+void LibUSBHost::detach(int slot)
+{
+	Device &d = devs[slot];
+	if (d.handle) {
+		std::lock_guard<std::mutex> g(lock);
+		bool busy = false;
+		for (size_t i = 0; i < pending.size(); i++)
+			if (pending[i].handle == d.handle) {
+				libusb_cancel_transfer(pending[i].xfer);
+				busy = true;
+			}
+		if (busy)
+			closing.push_back(d.handle);
+		else
+			libusb_close(d.handle);
+	}
+	if (d.dev)
+		libusb_unref_device(d.dev);
+	d.dev = NULL;
+	d.handle = NULL;
+	d.present = false;
+}
+
+// Compare the device list with the slots and queue arrivals and removals
+// (event thread, and once from start())
+void LibUSBHost::scan(void)
+{
 	libusb_device **list;
 	ssize_t n = libusb_get_device_list(ctx, &list);
-	for (size_t w = 0; w < wanted.size(); w++) {
+	if (n < 0)
+		return;
+	std::vector<Event> found;
+	for (size_t s = 0; s < known.size(); s++) {
+		if (known[s] == NULL)
+			continue;
+		bool still = false;
+		for (ssize_t i = 0; i < n && !still; i++)
+			still = list[i] == known[s];
+		if (!still) {
+			libusb_unref_device(known[s]);
+			known[s] = NULL;
+			Event e = {(int)s, NULL};
+			found.push_back(e);
+		}
+	}
+	for (size_t s = 0; s < known.size(); s++) {
+		if (known[s] != NULL)
+			continue;
 		for (ssize_t i = 0; i < n; i++) {
 			libusb_device_descriptor dd;
 			if (libusb_get_device_descriptor(list[i], &dd) != 0
-			 || dd.idVendor != wanted[w].first || dd.idProduct != wanted[w].second)
+			 || dd.idVendor != devs[s].vid || dd.idProduct != devs[s].pid)
 				continue;
-			Device d;
-			d.dev = libusb_ref_device(list[i]);
-			d.handle = NULL;
-			int speed = libusb_get_device_speed(list[i]);
-			d.low_speed = speed == LIBUSB_SPEED_LOW;
-			d.high_speed = speed >= LIBUSB_SPEED_HIGH;
-			int err = libusb_open(list[i], &d.handle);
-			if (err != 0)
-				d.handle = NULL;
-			char buf[64];
-			snprintf(buf, sizeof(buf), "%04x:%04x %s%s", dd.idVendor, dd.idProduct,
-			         d.low_speed ? "low speed" : d.high_speed ? "high speed" : "full speed",
-			         d.handle ? "" : ", descriptors only");
-			d.label = buf;
-			devs.push_back(d);
+			bool used = false;
+			for (size_t o = 0; o < known.size(); o++)
+				used |= known[o] == list[i];
+			if (used)
+				continue;
+			known[s] = libusb_ref_device(list[i]);
+			Event e = {(int)s, libusb_ref_device(list[i])};
+			found.push_back(e);
 			break;
 		}
 	}
 	libusb_free_device_list(list, 1);
+	if (!found.empty()) {
+		std::lock_guard<std::mutex> g(lock);
+		events_found.insert(events_found.end(), found.begin(), found.end());
+	}
+}
 
-	for (size_t i = 0; i < devs.size(); i++)
-		if (devs[i].handle) {
-			events = std::thread(&LibUSBHost::event_loop, this);
-			break;
-		}
+uint32 LibUSBHost::changes(void)
+{
+	std::deque<Event> ev;
+	{
+		std::lock_guard<std::mutex> g(lock);
+		ev.swap(events_found);
+	}
+	uint32 mask = 0;
+	for (size_t i = 0; i < ev.size(); i++) {
+		int slot = ev[i].slot;
+		if (devs[slot].present)
+			detach(slot);
+		if (ev[i].dev)
+			attach(slot, ev[i].dev);
+		mask |= 1 << slot;
+	}
+	return mask;
 }
 
 void LibUSBHost::event_loop(void)
 {
+	int ticks = 0;
 	while (!quit) {
 		struct timeval tv = {0, 100000};
 		libusb_handle_events_timeout_completed(ctx, &tv, NULL);
+		if (++ticks >= 10) {		// hotplug: Windows libusb has no callbacks
+			ticks = 0;
+			bool had;
+			{
+				std::lock_guard<std::mutex> g(lock);
+				had = !events_found.empty();
+			}
+			scan();
+			bool has;
+			{
+				std::lock_guard<std::mutex> g(lock);
+				has = !events_found.empty();
+			}
+			if (has && !had) {
+				SetInterruptFlag(INTFLAG_USB);
+				TriggerInterrupt();
+			}
+		}
 	}
 }
 
@@ -201,7 +333,7 @@ void LIBUSB_CALL LibUSBHost::transfer_done(libusb_transfer *xfer)
 bool LibUSBHost::submit(int dev, uint8 ep, int type, uint8 *data, int length, uint32 tag)
 {
 	start();
-	if (!valid(dev) || devs[dev].handle == NULL)
+	if (!valid(dev) || !devs[dev].present || devs[dev].handle == NULL)
 		return false;
 	libusb_transfer *xfer = libusb_alloc_transfer(0);
 	if (xfer == NULL)
@@ -210,7 +342,7 @@ bool LibUSBHost::submit(int dev, uint8 ep, int type, uint8 *data, int length, ui
 		libusb_fill_interrupt_transfer(xfer, devs[dev].handle, ep, data, length, transfer_done, this, 0);
 	else
 		libusb_fill_bulk_transfer(xfer, devs[dev].handle, ep, data, length, transfer_done, this, 0);
-	Pending p = {xfer, dev, ep, tag};
+	Pending p = {xfer, devs[dev].handle, dev, ep, tag};
 	{
 		std::lock_guard<std::mutex> g(lock);
 		pending.push_back(p);
@@ -227,6 +359,18 @@ bool LibUSBHost::submit(int dev, uint8 ep, int type, uint8 *data, int length, ui
 bool LibUSBHost::reap(uint32 *tag, int *result, bool *cancelled)
 {
 	std::lock_guard<std::mutex> g(lock);
+	// Close the handles of unplugged devices once their transfers are gone
+	for (size_t c = 0; c < closing.size(); ) {
+		bool busy = false;
+		for (size_t i = 0; i < pending.size() && !busy; i++)
+			busy = pending[i].handle == closing[c];
+		if (busy)
+			c++;
+		else {
+			libusb_close(closing[c]);
+			closing.erase(closing.begin() + c);
+		}
+	}
 	if (done.empty())
 		return false;
 	*tag = done.front().tag;
@@ -240,13 +384,13 @@ void LibUSBHost::cancel(int dev, uint8 ep)
 {
 	std::lock_guard<std::mutex> g(lock);
 	for (size_t i = 0; i < pending.size(); i++)
-		if (pending[i].dev == dev && pending[i].ep == ep)
+		if (pending[i].dev == dev && pending[i].ep == ep && pending[i].handle == devs[dev].handle)
 			libusb_cancel_transfer(pending[i].xfer);
 }
 
 void LibUSBHost::clear_halt(int dev, uint8 ep)
 {
-	if (valid(dev) && devs[dev].handle)
+	if (valid(dev) && devs[dev].present && devs[dev].handle)
 		libusb_clear_halt(devs[dev].handle, ep);
 }
 
@@ -350,7 +494,7 @@ int LibUSBHost::cached_request(Device &d, const uint8 *setup, uint8 *data, int l
 int LibUSBHost::control(int dev, const uint8 *setup, uint8 *data, int length)
 {
 	start();
-	if (!valid(dev))
+	if (!valid(dev) || !devs[dev].present)
 		return USB_HOST_ERROR;
 	Device &d = devs[dev];
 	if (d.handle == NULL)

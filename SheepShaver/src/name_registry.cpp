@@ -551,9 +551,11 @@ static void rh_reset(void)
 	for (int i = 0; i < RH_PORTS; i++)
 		rh.port_status[i] = PORT_POWER;
 
-	// Passed-through host devices: one per port, connected from the start
+	// Passed-through host devices: one port each, connected if plugged in
 	int n = USBHost ? USBHost->count() : 0;
 	for (int i = 0; i < n && i < RH_PORTS; i++) {
+		if (!USBHost->present(i))
+			continue;
 		rh.port_status[i] |= PORT_CONNECTION | (USBHost->low_speed(i) ? PORT_LOW_SPEED : 0);
 		rh.port_change[i] |= PORT_CONNECTION;
 		if (usb_log)
@@ -714,7 +716,8 @@ static void rh_control_transfer(uint32 refcon, uint32 proc, uint32 buffer, uint3
 
 enum {
 	kUSBEndpointStallErr = -6912,
-	kUSBNotRespondingErr = -6911
+	kUSBNotRespondingErr = -6911,
+	kUSBAbortedErr = -6982
 };
 
 static struct usb_dev_state {
@@ -875,11 +878,7 @@ static void usb_reap_transfers(void)
 			if (x->tag != tag)
 				continue;
 			usb_xfers.erase(usb_xfers.begin() + i);
-			if (cancelled) {			// aborted by the Mac: no completion
-				delete x;
-				break;
-			}
-			int32 status = result >= 0 ? 0 : usb_host_status(result);
+			int32 status = cancelled ? kUSBAbortedErr : result >= 0 ? 0 : usb_host_status(result);
 			uint32 n = result >= 0 ? result : 0;
 			if ((x->ep & 0x80) && n)
 				Host2Mac_memcpy(x->buffer, &x->data[0], n);
@@ -894,11 +893,44 @@ static void usb_reap_transfers(void)
 	busy = false;
 }
 
+// Devices plugged in or out on the host become root hub port connection
+// changes; Mac OS's hub driver then enumerates or removes them
+static void usb_hotplug(void)
+{
+	if (USBHost == NULL)
+		return;
+	uint32 mask = USBHost->changes();
+	if (mask == 0)
+		return;
+	int n = USBHost->count();
+	for (int i = 0; i < n && i < RH_PORTS; i++) {
+		if (!(mask & (1 << i)))
+			continue;
+		rh.port_status[i] &= ~(PORT_CONNECTION | PORT_ENABLE | PORT_SUSPEND | PORT_LOW_SPEED);
+		if (USBHost->present(i))
+			rh.port_status[i] |= PORT_CONNECTION | (USBHost->low_speed(i) ? PORT_LOW_SPEED : 0);
+		rh.port_change[i] |= PORT_CONNECTION;
+		usb_devs[i].address = 0;
+		usb_devs[i].have_pending_address = false;
+		if (rh.reset_port == i)
+			rh.reset_port = -1;
+		if (usb_log) {
+			if (USBHost->present(i))
+				fprintf(usb_log, "      port %d: %s plugged in\n", i + 1, USBHost->name(i));
+			else
+				fprintf(usb_log, "      port %d: unplugged\n", i + 1);
+			fflush(usb_log);
+		}
+	}
+	rh_check_status_change();
+}
+
 // USB interrupt (INTFLAG_USB): host transfers have finished. Mac OS may be
 // waiting for one without calling the USB stack, so complete them now, as a
 // host controller's interrupt would.
 void USBInterrupt(void)
 {
+	usb_hotplug();
 	usb_reap_transfers();
 	usb_deliver_completions();
 }
@@ -936,6 +968,7 @@ uint32 USBUIMCall(uint32 slot, uint32 toc, uint32 ret, uint32 a1, uint32 a2, uin
 
 	// Polling calls from the USB stack deliver finished transfers
 	if (slot == 22 || slot == 24 || slot == 25 || (slot == 28 && uim_version == 6)) {
+		usb_hotplug();
 		usb_reap_transfers();
 		usb_deliver_completions();
 	}

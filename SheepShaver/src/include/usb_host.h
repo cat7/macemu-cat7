@@ -30,8 +30,17 @@ class USBHostBackend {
 public:
 	virtual ~USBHostBackend() {}
 
-	// Number of passed-through devices (ports 1..count on the root hub)
+	// Number of passed-through device slots (ports 1..count on the root hub);
+	// a slot's device may come and go (hotplug)
 	virtual int count(void) = 0;
+
+	// Device is plugged in (and can be enumerated)
+	virtual bool present(int dev) = 0;
+
+	// Apply plug/unplug events found by the host; returns a bit mask of the
+	// slots whose presence changed since the last call. Call from the
+	// emulator thread only (INTFLAG_USB is raised when there is news).
+	virtual uint32 changes(void) = 0;
 
 	// Device is low speed (1.5 Mbit/s)
 	virtual bool low_speed(int dev) = 0;
