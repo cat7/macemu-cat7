@@ -49,6 +49,8 @@ user_string_def platform_strings[] = {
 
 	{STR_ABOUT_BUTTON, "About"},
 	{STR_FILE_CTRL, "File"},
+	{STR_MIDI_OUT_CTRL, "MIDI Out"},
+	{STR_MIDI_IN_CTRL, "MIDI In"},
 	{STR_BROWSE_TITLE, "Browse file"},
 	{STR_BROWSE_CTRL, "Browse..."},
 	{STR_SERIAL_PANE_TITLE, "Serial"},

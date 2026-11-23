@@ -27,6 +27,7 @@
 #include <gtk/gtk.h>
 
 #include <shellapi.h>
+#include <mmsystem.h>
 
 #include <fstream>
 
@@ -1674,8 +1675,13 @@ static void create_input_pane(GtkWidget *top)
  *  "Serial" pane
  */
 
-static GtkWidget *w_seriala, *w_portfile0;
-static GtkWidget *w_serialb, *w_portfile1;
+static GtkWidget *w_seriala, *w_portfile0, *w_midiout0, *w_midiin0;
+static GtkWidget *w_serialb, *w_portfile1, *w_midiout1, *w_midiin1;
+
+// Combo entries that stand for "no prefs item" or "input off"
+static const char MIDI_OUT_DEFAULT[] = "Default (MIDI Mapper)";
+static const char MIDI_IN_DEFAULT[] = "Default (first input device)";
+static const char MIDI_IN_NONE[] = "none";
 
 // Set sensitivity of widgets
 static void set_serial_sensitive(void)
@@ -1692,6 +1698,24 @@ static void set_serial_sensitive(void)
 	is_file = strcmp(str, "FILE") == 0;
 	gtk_widget_set_sensitive(w_portfile1, is_file);
 	gtk_widget_set_sensitive(GTK_WIDGET(g_object_get_data(G_OBJECT(w_portfile1), "chooser_button")), is_file);
+
+	bool is_midi;
+	is_midi = _stricmp(gtk_entry_get_text(GTK_ENTRY(w_seriala)), "MIDI") == 0;
+	gtk_widget_set_sensitive(w_midiout0, is_midi);
+	gtk_widget_set_sensitive(w_midiin0, is_midi);
+	is_midi = _stricmp(gtk_entry_get_text(GTK_ENTRY(w_serialb)), "MIDI") == 0;
+	gtk_widget_set_sensitive(w_midiout1, is_midi);
+	gtk_widget_set_sensitive(w_midiin1, is_midi);
+}
+
+// Store a MIDI device combo: the "default" entry (or an empty one) removes the item
+static void read_midi_setting(GtkWidget *combo, const char *prefs_item, const char *default_label)
+{
+	const char *str = gtk_entry_get_text(GTK_ENTRY(GTK_COMBO(combo)->entry));
+	if (str == NULL || *str == 0 || strcmp(str, default_label) == 0)
+		PrefsRemoveItem(prefs_item);
+	else
+		PrefsReplaceString(prefs_item, str);
 }
 
 // Read settings from widgets and set preferences
@@ -1710,6 +1734,11 @@ static void read_serial_settings(void)
 
 	str = gtk_entry_get_text(GTK_ENTRY(w_portfile1));
 	PrefsReplaceString("portfile1", str);
+
+	read_midi_setting(w_midiout0, "midiout0", MIDI_OUT_DEFAULT);
+	read_midi_setting(w_midiin0, "midiin0", MIDI_IN_DEFAULT);
+	read_midi_setting(w_midiout1, "midiout1", MIDI_OUT_DEFAULT);
+	read_midi_setting(w_midiin1, "midiin1", MIDI_IN_DEFAULT);
 }
 
 // Port changed in combo
@@ -1727,6 +1756,7 @@ static GList *add_serial_names(void)
 		"COM1", "COM2", "COM3", "COM4", "COM5", "COM6",
 		"LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6",
 		"FILE",
+		"MIDI",
 		NULL
 	};
 
@@ -1736,6 +1766,42 @@ static GList *add_serial_names(void)
 	return glist;
 }
 
+// Names of the Windows MIDI devices, after the given special entries
+static GList *add_midi_names(bool output, const char *first, const char *second)
+{
+	GList *glist = NULL;
+	glist = g_list_append(glist, (void *)first);
+	if (second)
+		glist = g_list_append(glist, (void *)second);
+
+	UINT n = output ? midiOutGetNumDevs() : midiInGetNumDevs();
+	for (UINT i = 0; i < n; i++) {
+		char name[MAXPNAMELEN];
+		bool ok;
+		if (output) {
+			MIDIOUTCAPSA caps;
+			ok = midiOutGetDevCapsA(i, &caps, sizeof(caps)) == MMSYSERR_NOERROR;
+			if (ok) strcpy(name, caps.szPname);
+		} else {
+			MIDIINCAPSA caps;
+			ok = midiInGetDevCapsA(i, &caps, sizeof(caps)) == MMSYSERR_NOERROR;
+			if (ok) strcpy(name, caps.szPname);
+		}
+		if (ok)
+			glist = g_list_append(glist, g_strdup(name));
+	}
+	return glist;
+}
+
+// MIDI device combo showing the current prefs value (any typed value is kept)
+static GtkWidget *table_make_midi_combo(GtkWidget *table, int row, int label_id, const char *prefs_item, GList *glist, const char *default_label)
+{
+	const char *str = PrefsFindString(prefs_item);
+	if (str == NULL || *str == 0)
+		str = default_label;
+	return table_make_combobox(table, row, label_id, str, glist);
+}
+
 // Create "Serial" pane
 static void create_serial_pane(GtkWidget *top)
 {
@@ -1743,7 +1809,10 @@ static void create_serial_pane(GtkWidget *top)
 	GtkObject *adj;
 
 	box = make_pane(top, STR_SERIAL_PANE_TITLE);
-	table = make_table(box, 2, 5);
+	table = make_table(box, 2, 9);
+
+	GList *midi_out_list = add_midi_names(true, MIDI_OUT_DEFAULT, NULL);
+	GList *midi_in_list = add_midi_names(false, MIDI_IN_DEFAULT, MIDI_IN_NONE);
 
 	GList *glist = add_serial_names();
 	const char *str = PrefsFindString("seriala");
@@ -1752,17 +1821,21 @@ static void create_serial_pane(GtkWidget *top)
 	gtk_signal_connect(GTK_OBJECT(w_seriala), "changed", GTK_SIGNAL_FUNC(cb_serial_port_changed), NULL);
 
 	w_portfile0 = table_make_file_entry(table, 1, STR_FILE_CTRL, "portfile0");
+	w_midiout0 = table_make_midi_combo(table, 2, STR_MIDI_OUT_CTRL, "midiout0", midi_out_list, MIDI_OUT_DEFAULT);
+	w_midiin0 = table_make_midi_combo(table, 3, STR_MIDI_IN_CTRL, "midiin0", midi_in_list, MIDI_IN_DEFAULT);
 
 	sep = gtk_hseparator_new();
 	gtk_widget_show(sep);
-	gtk_table_attach(GTK_TABLE(table), sep, 0, 2, 2, 3, (GtkAttachOptions)0, (GtkAttachOptions)0, 4, 4);
+	gtk_table_attach(GTK_TABLE(table), sep, 0, 2, 4, 5, (GtkAttachOptions)0, (GtkAttachOptions)0, 4, 4);
 
 	str = PrefsFindString("serialb");
-	combo = table_make_combobox(table, 3, STR_SERIALB_CTRL, str, glist);
+	combo = table_make_combobox(table, 5, STR_SERIALB_CTRL, str, glist);
 	w_serialb = GTK_COMBO(combo)->entry;
 	gtk_signal_connect(GTK_OBJECT(w_serialb), "changed", GTK_SIGNAL_FUNC(cb_serial_port_changed), NULL);
 
-	w_portfile1 = table_make_file_entry(table, 4, STR_FILE_CTRL, "portfile1");
+	w_portfile1 = table_make_file_entry(table, 6, STR_FILE_CTRL, "portfile1");
+	w_midiout1 = table_make_midi_combo(table, 7, STR_MIDI_OUT_CTRL, "midiout1", midi_out_list, MIDI_OUT_DEFAULT);
+	w_midiin1 = table_make_midi_combo(table, 8, STR_MIDI_IN_CTRL, "midiin1", midi_in_list, MIDI_IN_DEFAULT);
 
 	set_serial_sensitive();
 }
