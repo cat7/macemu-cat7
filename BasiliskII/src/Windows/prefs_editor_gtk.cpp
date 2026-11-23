@@ -1301,6 +1301,12 @@ static void tb_nosound(GtkWidget *widget)
 	set_graphics_sensitive();
 }
 
+// "Sound Input Gain" slider moved
+static void adj_soundingain(GtkAdjustment *adj)
+{
+	PrefsReplaceInt32("soundingain", (int32)(adj->value + 0.5));
+}
+
 // SDL Graphics
 #ifdef USE_SDL_VIDEO
 // SDL Renderer Render Driver
@@ -1555,6 +1561,29 @@ static void create_graphics_pane(GtkWidget *top)
 
 	make_separator(box);
 	make_checkbox(box, STR_NOSOUND_CTRL, "nosound", GTK_SIGNAL_FUNC(tb_nosound));
+
+	// Sound input boost ("soundingain", percent; 100 = unchanged)
+	{
+		GtkWidget *hbox = gtk_hbox_new(FALSE, 4);
+		gtk_widget_show(hbox);
+		gtk_box_pack_start(GTK_BOX(box), hbox, FALSE, FALSE, 0);
+
+		GtkWidget *label = gtk_label_new(GetString(STR_SOUNDIN_GAIN_CTRL));
+		gtk_widget_show(label);
+		gtk_box_pack_start(GTK_BOX(hbox), label, FALSE, FALSE, 0);
+
+		int32 gain = PrefsFindInt32("soundingain");
+		if (gain <= 0)
+			gain = 100;
+		GtkObject *gain_adj = gtk_adjustment_new(gain, 25, 400, 5, 25, 0);
+		GtkWidget *scale = gtk_hscale_new(GTK_ADJUSTMENT(gain_adj));
+		gtk_scale_set_digits(GTK_SCALE(scale), 0);
+		gtk_scale_set_value_pos(GTK_SCALE(scale), GTK_POS_RIGHT);
+		gtk_widget_show(scale);
+		gtk_box_pack_start(GTK_BOX(hbox), scale, TRUE, TRUE, 0);
+		gtk_signal_connect(gain_adj, "value_changed", GTK_SIGNAL_FUNC(adj_soundingain), NULL);
+		adj_soundingain(GTK_ADJUSTMENT(gain_adj));	// store the (clamped) value
+	}
 
 	set_graphics_sensitive();
 

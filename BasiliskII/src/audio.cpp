@@ -33,6 +33,7 @@
 #include "audio_defs.h"
 #include "user_strings.h"
 #include "cdrom.h"
+#include "prefs.h"
 
 #define DEBUG 0
 #include "debug.h"
@@ -638,6 +639,15 @@ static int soundin_frame_size(void)
 	return (si.sample_size / 8) * si.channels;
 }
 
+// Gain for the host stream: the Mac's input gain times the "soundingain" boost
+static float soundin_host_gain(void)
+{
+	int32 boost = PrefsFindInt32("soundingain");
+	if (boost <= 0)
+		boost = 100;
+	return (si.gain / 65536.0f) * (boost / 100.0f);
+}
+
 // Open host capture, or apply the current format to it
 static bool soundin_start_device(void)
 {
@@ -648,7 +658,7 @@ static bool soundin_start_device(void)
 		si.device_running = false;
 		return false;
 	}
-	AudioInBackend->set_gain(si.gain / 65536.0f);
+	AudioInBackend->set_gain(soundin_host_gain());
 	si.device_running = true;
 	return true;
 }
@@ -961,7 +971,7 @@ int16 SoundInControl(uint32 pb, uint32 dce)
 			if (si.gain < 0x8000) si.gain = 0x8000;
 			if (si.gain > 0x18000) si.gain = 0x18000;
 			if (si.device_running)
-				AudioInBackend->set_gain(si.gain / 65536.0f);
+				AudioInBackend->set_gain(soundin_host_gain());
 			return noErr;
 
 		case siInputSource: {

@@ -85,6 +85,7 @@ prefs_desc common_prefs_items[] = {
 	{"host_domain", TYPE_STRING, true,	"handle DNS requests for this domain on the host (slirp only)"},
 	{"title", TYPE_STRING, false,	"window title"},
 	{"sound_buffer", TYPE_INT32, false,	"sound buffer length"},
+	{"soundingain", TYPE_INT32, false,	"sound input boost in percent (100 = none)"},
 	{"name_encoding", TYPE_INT32, false,	"file name encoding"},
 	{"delay", TYPE_INT32, false,	"additional delay [uS] every 64k instructions"},
 	{"init_grab", TYPE_BOOLEAN, false,	"initially grabbing mouse"},
@@ -113,6 +114,7 @@ void AddPrefsDefaults(void)
 	PrefsAddBool("fpu", false);
 	PrefsAddBool("nocdrom", false);
 	PrefsAddBool("nosound", false);
+	PrefsAddInt32("soundingain", 100);
 	PrefsAddBool("noclipconversion", false);
 	PrefsAddBool("nogui", false);
 	

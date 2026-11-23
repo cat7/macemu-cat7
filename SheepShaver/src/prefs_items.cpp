@@ -72,6 +72,7 @@ prefs_desc common_prefs_items[] = {
 	{"redir", TYPE_STRING, true,		"port forwarding for slirp"},
 	{"title", TYPE_STRING, false,	"window title"},
 	{"sound_buffer", TYPE_INT32, false,	"sound buffer length"},
+	{"soundingain", TYPE_INT32, false,	"sound input boost in percent (100 = none)"},
 	{"name_encoding", TYPE_INT32, false,	"file name encoding"},
 	{"init_grab", TYPE_BOOLEAN, false,	"initially grabbing mouse"},
 	{NULL, TYPE_END, false, NULL} // End of list
@@ -94,6 +95,7 @@ void AddPrefsDefaults(void)
 	PrefsAddBool("nocdrom", false);
 	PrefsAddBool("nonet", false);
 	PrefsAddBool("nosound", false);
+	PrefsAddInt32("soundingain", 100);
 	PrefsAddBool("nogui", false);
 	PrefsAddBool("noclipconversion", false);
 	PrefsAddBool("ignoresegv", true);

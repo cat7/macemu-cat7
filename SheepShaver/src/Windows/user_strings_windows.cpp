@@ -58,6 +58,7 @@ user_string_def platform_strings[] = {
 	{STR_FILE_CTRL, "File"},
 	{STR_MIDI_OUT_CTRL, "MIDI Out"},
 	{STR_MIDI_IN_CTRL, "MIDI In"},
+	{STR_SOUNDIN_GAIN_CTRL, "Sound Input Gain (%)"},
 	{STR_BROWSE_TITLE, "Browse file"},
 	{STR_BROWSE_CTRL, "Browse..."},
 	{STR_SERIAL_PANE_TITLE, "Serial"},
