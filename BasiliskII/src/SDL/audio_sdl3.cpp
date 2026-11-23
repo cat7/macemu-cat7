@@ -193,8 +193,84 @@ static bool open_audio(void)
 	return true;
 }
 
+/*
+ *  Sound input: record from the host's default recording device. SDL converts
+ *  to the format the Mac asked for; the callback only signals new data.
+ */
+
+static SDL_AudioStream *in_stream = NULL;
+
+static void SDLCALL in_stream_func(void *, SDL_AudioStream *, int, int)
+{
+	SoundInDataArrived();
+}
+
+static bool in_start(int rate, int bits, int channels, bool is_signed)
+{
+	SDL_AudioSpec spec;
+	spec.format = bits == 16 ? SDL_AUDIO_S16BE : (is_signed ? SDL_AUDIO_S8 : SDL_AUDIO_U8);
+	spec.channels = channels;
+	spec.freq = rate;
+
+	if (in_stream) {
+		// For a recording stream the destination side is ours
+		if (!SDL_SetAudioStreamFormat(in_stream, NULL, &spec)) {
+			D(bug("SDL_SetAudioStreamFormat (recording) failed: %s\n", SDL_GetError()));
+			return false;
+		}
+		return true;
+	}
+	in_stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_RECORDING, &spec, in_stream_func, NULL);
+	if (in_stream == NULL) {
+		printf("WARNING: Cannot open audio recording device: %s\n", SDL_GetError());
+		return false;
+	}
+	SDL_ResumeAudioStreamDevice(in_stream);
+	return true;
+}
+
+static void in_stop(void)
+{
+	if (in_stream) {
+		SDL_DestroyAudioStream(in_stream);	// also closes the device
+		in_stream = NULL;
+	}
+}
+
+static uint32 in_available(void)
+{
+	int n = in_stream ? SDL_GetAudioStreamAvailable(in_stream) : 0;
+	return n > 0 ? n : 0;
+}
+
+static uint32 in_read(uint8 *buf, uint32 len)
+{
+	int n = in_stream ? SDL_GetAudioStreamData(in_stream, buf, len) : 0;
+	return n > 0 ? n : 0;
+}
+
+static void in_clear(void)
+{
+	if (in_stream)
+		SDL_ClearAudioStream(in_stream);
+}
+
+static void in_set_gain(float gain)
+{
+	if (in_stream)
+		SDL_SetAudioStreamGain(in_stream, gain);
+}
+
+static const audio_in_backend sdl3_audio_in = {
+	in_start, in_stop, in_available, in_read, in_clear, in_set_gain
+};
+
+
 void AudioInit(void)
 {
+	// Sound input is independent of output (and of "nosound")
+	AudioInBackend = &sdl3_audio_in;
+
 	// Init audio status and feature flags
 	AudioStatus.sample_rate = 44100 << 16;
 	AudioStatus.sample_size = 16;
@@ -234,6 +310,10 @@ static void close_audio(void)
 
 void AudioExit(void)
 {
+	// Close recording device
+	in_stop();
+	AudioInBackend = NULL;
+
 	// Close audio device
 	close_audio();
 #ifdef BINCUE

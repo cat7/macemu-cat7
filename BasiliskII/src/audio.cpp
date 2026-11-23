@@ -61,9 +61,12 @@ int SoundInGain = 65536; // FIXED 4-byte from 0.5 to 1.5; this is middle value (
  *  Reset audio emulation
  */
 
+static void SoundInReset(void);
+
 void AudioReset(void)
 {
 	audio_data = 0;
+	SoundInReset();
 }
 
 
@@ -538,7 +541,251 @@ delegate:	// Delegate call to Apple Mixer
 	}
 }
 
-// not currently using these functions
+/*
+ *  Sound input driver (.AppleSoundInput replacement)
+ *
+ *  SEE ALSO
+ *    Inside Macintosh: Sound, chapter 3 "Writing a Sound Input Device Driver"
+ *
+ *  The Mac side issues Status/Control calls with csCode 2 and a selector
+ *  in csParam[0..3]. Control data follows the selector; Status answers of
+ *  up to 18 bytes go back inline (byte count in csParam[0..3], data from
+ *  csParam+4), longer ones are copied to the buffer whose address is in
+ *  csParam+4 (and the count is 0).
+ *
+ *  A Read (Prime) records into ioBuffer. It stays pending (Prime returns 1)
+ *  and is filled incrementally from SoundInInterrupt(), which the host
+ *  backend triggers whenever new data arrives; ioActCount is kept current so
+ *  a KillIO (SPBStop) leaves the recorded length in place. When the buffer
+ *  is full the request is completed with IODone from a deferred task.
+ */
+
+const audio_in_backend *AudioInBackend = NULL;
+
+static const int16 siUnknownInfoType = -231;
+static const int16 siDeviceBusyErrIn = -227;
+
+// Deferred task that calls IODone (same layout as the serial driver's)
+enum {
+	sidtCode = 20,		// 68k code
+	sidtResult = 30,	// result code for IODone
+	sidtDCE = 34,		// DCE for IODone
+	SIZEOF_sidt = 38
+};
+
+// Rates offered to the Mac (16.16 fixed); the backend converts from the host
+static const uint32 soundin_rates[] = {
+	0x1f400000,		//  8000 Hz
+	0x2b110000,		// 11025 Hz
+	0x2b7745d1,		// 11127 Hz (Mac 11 kHz)
+	0x56220000,		// 22050 Hz
+	0x56ee8ba3,		// 22254 Hz (Mac 22 kHz)
+	0xac440000,		// 44100 Hz
+	0xbb800000		// 48000 Hz
+};
+static const int NUM_SOUNDIN_RATES = sizeof(soundin_rates) / sizeof(soundin_rates[0]);
+
+static struct {
+	// Driver settings
+	uint32 sample_rate;			// 16.16 fixed
+	int16 sample_size;			// 8 or 16
+	int16 channels;				// 1 or 2
+	bool twos_complement;		// 8-bit samples signed
+	bool continuous;
+	bool paused;
+	bool agc;
+	bool meter_on;
+	uint32 quality;
+	uint32 gain;				// 16.16 fixed, 0.5 .. 1.5
+	uint32 user_proc;			// Sound Input Manager interrupt routine (not called)
+	int16 source;
+	int16 playthrough;
+
+	// State
+	uint32 dt;					// deferred task (Mac address)
+	bool device_running;		// host capture is open
+	bool recording;				// a recording session is active
+	volatile bool read_pending;	// a Read is waiting for data
+	uint32 read_pb, read_dce;
+	uint32 read_done;			// bytes stored so far
+	uint8 level;				// last peak level, 0..255
+} si;
+
+static void soundin_set_defaults(void)
+{
+	si.sample_rate = 0x56ee8ba3;	// "if possible: 22 kHz, 8 bit, mono, no compression, AGC on"
+	si.sample_size = 8;
+	si.channels = 1;
+	si.twos_complement = false;
+	si.continuous = false;
+	si.paused = false;
+	si.agc = true;
+	si.meter_on = false;
+	si.quality = siBestQuality;
+	si.gain = 0x10000;
+	si.user_proc = 0;
+	si.source = 1;
+	si.playthrough = 0;
+}
+
+static int soundin_rate_hz(void)
+{
+	return (int)((si.sample_rate + 0x8000) >> 16);
+}
+
+static int soundin_frame_size(void)
+{
+	return (si.sample_size / 8) * si.channels;
+}
+
+// Open host capture, or apply the current format to it
+static bool soundin_start_device(void)
+{
+	if (AudioInBackend == NULL)
+		return false;
+	if (!AudioInBackend->start(soundin_rate_hz(), si.sample_size, si.channels, si.sample_size == 16 || si.twos_complement)) {
+		D(bug(" sound input: host capture failed to start\n"));
+		si.device_running = false;
+		return false;
+	}
+	AudioInBackend->set_gain(si.gain / 65536.0f);
+	si.device_running = true;
+	return true;
+}
+
+static void soundin_stop_device(void)
+{
+	if (si.device_running && AudioInBackend)
+		AudioInBackend->stop();
+	si.device_running = false;
+}
+
+// Format changed by the Mac: reformat capture if it is running
+static void soundin_format_changed(void)
+{
+	if (si.device_running)
+		soundin_start_device();
+}
+
+// Peak level of a block of samples in the current format, 0..255
+static uint8 soundin_peak(const uint8 *p, uint32 len)
+{
+	int peak = 0;
+	if (si.sample_size == 16) {
+		for (uint32 i = 0; i + 1 < len; i += 2) {
+			int v = (int16)((p[i] << 8) | p[i + 1]);
+			if (v < 0) v = -v;
+			if (v > peak) peak = v;
+		}
+		peak >>= 7;
+	} else {
+		for (uint32 i = 0; i < len; i++) {
+			int v = si.twos_complement ? (int8)p[i] : (int)p[i] - 128;
+			if (v < 0) v = -v;
+			if (v > peak) peak = v;
+		}
+		peak <<= 1;
+	}
+	return peak > 255 ? 255 : peak;
+}
+
+// Read data from the host, only whole frames
+static uint32 soundin_host_read(uint8 *buf, uint32 len)
+{
+	uint32 frame = soundin_frame_size();
+	len -= len % frame;
+	if (len == 0)
+		return 0;
+	uint32 n = AudioInBackend->read(buf, len);
+	if (n)
+		si.level = soundin_peak(buf, n);
+	return n;
+}
+
+// Complete the pending Read via IODone, from a deferred task
+static void soundin_complete_read(int16 result)
+{
+	si.read_pending = false;
+	WriteMacInt32(si.read_pb + ioActCount, si.read_done);
+	WriteMacInt32(si.dt + sidtResult, result);
+	WriteMacInt32(si.dt + sidtDCE, si.read_dce);
+	M68kRegisters r;
+	r.a[0] = si.dt;
+	Execute68kTrap(0xa082, &r);		// DTInstall()
+	D(bug(" sound input read complete, %u bytes\n", si.read_done));
+}
+
+// Called by the host backend from its own thread
+void SoundInDataArrived(void)
+{
+	if (si.read_pending) {
+		SetInterruptFlag(INTFLAG_SOUNDIN);
+		TriggerInterrupt();
+	}
+}
+
+// Interrupt: move recorded data into the pending Read
+void SoundInInterrupt(void)
+{
+	if (!si.read_pending || !si.device_running)
+		return;
+
+	uint32 buffer = ReadMacInt32(si.read_pb + ioBuffer);
+	uint32 wanted = ReadMacInt32(si.read_pb + ioReqCount);
+	uint8 tmp[4096];
+
+	while (si.read_done < wanted) {
+		uint32 n = wanted - si.read_done;
+		if (n > sizeof(tmp))
+			n = sizeof(tmp);
+		n = soundin_host_read(tmp, n);
+		if (n == 0)
+			break;
+		if (si.paused)
+			continue;			// recording continues but is not stored
+		if (buffer)
+			Host2Mac_memcpy(buffer + si.read_done, tmp, n);
+		si.read_done += n;		// NIL buffer: record without saving
+	}
+	WriteMacInt32(si.read_pb + ioActCount, si.read_done);
+
+	if (si.read_done >= wanted) {
+		soundin_complete_read(noErr);
+		if (!si.continuous) {
+			// Next Read starts a new recording; stop capturing until then
+			si.recording = false;
+			if (!si.meter_on)
+				soundin_stop_device();
+		}
+	}
+}
+
+// Stop recording (KillIO, siCloseDriver, Close)
+static void soundin_stop_recording(void)
+{
+	if (si.read_pending) {
+		SoundInInterrupt();		// take what has arrived
+		si.read_pending = false;
+		WriteMacInt32(si.read_pb + ioActCount, si.read_done);
+		D(bug(" sound input stopped, %u bytes recorded\n", si.read_done));
+	}
+	si.recording = false;
+	if (!si.meter_on)
+		soundin_stop_device();
+}
+
+
+// Mac restarted: the deferred task and any pending Read are gone
+static void SoundInReset(void)
+{
+	soundin_stop_device();
+	si.dt = 0;
+	si.read_pending = false;
+	si.recording = false;
+	si.meter_on = false;
+}
+
+
 /*
  *  Sound input driver Open() routine
  */
@@ -546,32 +793,67 @@ delegate:	// Delegate call to Apple Mixer
 int16 SoundInOpen(uint32 pb, uint32 dce)
 {
 	D(bug("SoundInOpen\n"));
+
+	if (si.dt == 0) {
+		M68kRegisters r;
+		r.d[0] = SIZEOF_sidt;
+		Execute68kTrap(0xa71e, &r);	// NewPtrSysClear()
+		if (r.a[0] == 0)
+			return memFullErr;
+		uint32 dt = si.dt = r.a[0];
+		WriteMacInt16(dt + qType, dtQType);
+		WriteMacInt32(dt + dtAddr, dt + sidtCode);
+		WriteMacInt32(dt + dtParam, dt + sidtResult);
+		WriteMacInt16(dt + sidtCode, 0x2019);			// move.l	(a1)+,d0	(result)
+		WriteMacInt16(dt + sidtCode + 2, 0x2251);		// move.l	(a1),a1		(dce)
+		WriteMacInt32(dt + sidtCode + 4, 0x207808fc);	// move.l	JIODone,a0
+		WriteMacInt16(dt + sidtCode + 8, 0x4ed0);		// jmp		(a0)
+	}
+
+	soundin_set_defaults();
+	si.recording = si.read_pending = false;
+	si.level = 0;
 	return noErr;
 }
 
 
 /*
- *  Sound input driver Prime() routine
+ *  Sound input driver Prime() routine (Read: record into ioBuffer)
  */
 
 int16 SoundInPrime(uint32 pb, uint32 dce)
 {
-	D(bug("SoundInPrime\n"));
-	//!!
-	
-	uint16 code = ReadMacInt16(pb + csCode);
-	D(bug("SoundInControl %d\n", code));
+	uint32 wanted = ReadMacInt32(pb + ioReqCount);
+	D(bug("SoundInPrime %u bytes\n", wanted));
 
-	if (code == 1) {
-		D(bug(" SoundInKillIO\n"));
-		//!!
-		return noErr;
+	if (AudioInBackend == NULL)
+		return noHardwareErr;
+	if (si.read_pending)
+		return siDeviceBusyErrIn;
+
+	if (!si.device_running && !soundin_start_device())
+		return noHardwareErr;
+	if (!si.recording) {
+		// New recording: drop anything captured before it (e.g. while metering)
+		AudioInBackend->clear();
+		si.recording = true;
 	}
 
-	if (code != 2)
-		return -231;	// siUnknownInfoType
+	si.read_pb = pb;
+	si.read_dce = dce;
+	si.read_done = 0;
+	WriteMacInt32(pb + ioActCount, 0);
+	if (wanted == 0) {
+		si.read_pending = true;
+		soundin_complete_read(noErr);
+		return 1;
+	}
+	si.read_pending = true;
 
-	return noErr;
+	// Data may already be waiting (continuous recording)
+	SetInterruptFlag(INTFLAG_SOUNDIN);
+	TriggerInterrupt();
+	return 1;	// in progress, completed via IODone
 }
 
 
@@ -584,49 +866,125 @@ int16 SoundInControl(uint32 pb, uint32 dce)
 	uint16 code = ReadMacInt16(pb + csCode);
 	D(bug("SoundInControl %d\n", code));
 
-	if (code == 1) {
+	if (code == 1) {	// KillIO: stop copying, ioActCount holds the recorded length
 		D(bug(" SoundInKillIO\n"));
-		//!!
+		soundin_stop_recording();
 		return noErr;
 	}
 
 	if (code != 2)
-		return -231;	// siUnknownInfoType
-	
-	uint32 selector = ReadMacInt32(pb + csParam); // 4-byte selector (should match via FOURCC above)
+		return siUnknownInfoType;
+
+	uint32 selector = ReadMacInt32(pb + csParam);
+	uint32 data = pb + csParam + 4;
+	D(bug(" selector %c%c%c%c\n", selector >> 24, (selector >> 16) & 0xff, (selector >> 8) & 0xff, selector & 0xff));
 
 	switch (selector) {
-		case siInitializeDriver: {
-//			If possible, the driver initializes the device to a sampling rate of 22 kHz, a sample size of 8 bits, mono recording, no compression, automatic gain control on, and all other features off.
+		case siInitializeDriver:
+			soundin_stop_recording();
+			soundin_set_defaults();
+			return noErr;
+
+		case siCloseDriver:
+			si.meter_on = false;
+			soundin_stop_recording();
+			soundin_stop_device();
+			soundin_set_defaults();
+			return noErr;
+
+		case siSampleRate: {
+			uint32 rate = ReadMacInt32(data);
+			if (rate < 0x0fa00000 || rate > 0xbb800000)	// 4000 .. 48000 Hz
+				return paramErr;
+			si.sample_rate = rate;
+			soundin_format_changed();
 			return noErr;
 		}
-			
-		case siCloseDriver: {
-//			The sound input device driver should stop any recording in progress, deallocate the input hardware, and initialize local variables to default settings.
+
+		case siSampleSize: {
+			int16 size = ReadMacInt16(data);
+			if (size != 8 && size != 16)
+				return paramErr;
+			si.sample_size = size;
+			soundin_format_changed();
 			return noErr;
 		}
-			
+
+		case siNumberChannels: {
+			int16 n = ReadMacInt16(data);
+			if (n != 1 && n != 2)
+				return paramErr;
+			si.channels = n;
+			soundin_format_changed();
+			return noErr;
+		}
+
+		case siTwosComplementOnOff:
+			si.twos_complement = ReadMacInt16(data) != 0;
+			soundin_format_changed();
+			return noErr;
+
+		case siCompressionType: {
+			uint32 type = ReadMacInt32(data);
+			if (type != 0 && type != FOURCC('N','O','N','E') && type != FOURCC('r','a','w',' ') && type != FOURCC('t','w','o','s'))
+				return paramErr;	// samples are always delivered uncompressed
+			return noErr;
+		}
+
+		case siRecordingQuality:
+			si.quality = ReadMacInt32(data);	// all qualities record uncompressed
+			return noErr;
+
+		case siContinuous:
+			si.continuous = ReadMacInt16(data) != 0;
+			return noErr;
+
+		case siPauseRecording:
+			si.paused = ReadMacInt16(data) != 0;
+			return noErr;
+
+		case siAGCOnOff:
+			si.agc = ReadMacInt16(data) != 0;
+			return noErr;
+
+		case siLevelMeterOnOff:
+			si.meter_on = ReadMacInt16(data) != 0;
+			if (si.meter_on) {
+				if (!si.device_running)
+					soundin_start_device();
+			} else if (!si.recording)
+				soundin_stop_device();
+			return noErr;
+
+		case siInputGain:
+			si.gain = ReadMacInt32(data);
+			if (si.gain < 0x8000) si.gain = 0x8000;
+			if (si.gain > 0x18000) si.gain = 0x18000;
+			if (si.device_running)
+				AudioInBackend->set_gain(si.gain / 65536.0f);
+			return noErr;
+
 		case siInputSource: {
-			SoundInSource = ReadMacInt16(pb + csParam + 4);
+			int16 s = ReadMacInt16(data);
+			if (s < 1 || s > 2)
+				return paramErr;
+			si.source = s;		// both sources record from the host default device
 			return noErr;
 		}
-			
-		case siPlayThruOnOff: {
-			SoundInPlaythrough = ReadMacInt16(pb + csParam + 4);
+
+		case siPlayThruOnOff:
+			si.playthrough = ReadMacInt16(data);	// accepted, not implemented
 			return noErr;
-		}
-			
-		case siOptionsDialog: {
+
+		case siUserInterruptProc:
+			si.user_proc = ReadMacInt32(data);	// stored, not called
 			return noErr;
-		}
-			
-		case siInputGain: {
-			SoundInGain = ReadMacInt32(pb + csParam + 4);
-			return noErr;
-		}
-			
+
+		case siOptionsDialog:
+			return siUnknownInfoType;	// no options dialog
+
 		default:
-			return -231;	// siUnknownInfoType
+			return siUnknownInfoType;
 	}
 }
 
@@ -635,189 +993,200 @@ int16 SoundInControl(uint32 pb, uint32 dce)
  *  Sound input driver Status() routine
  */
 
-int16 SoundInStatus(uint32 pb, uint32 dce) // A0 points to Device Manager parameter block (pb) and A1 to device control entry (dce)
+// Answer inline: byte count in csParam[0..3], data from csParam+4 (<= 18 bytes)
+static void status_int16(uint32 pb, int16 v)
+{
+	WriteMacInt32(pb + csParam, 2);
+	WriteMacInt16(pb + csParam + 4, v);
+}
+
+static void status_int32(uint32 pb, uint32 v)
+{
+	WriteMacInt32(pb + csParam, 4);
+	WriteMacInt32(pb + csParam + 4, v);
+}
+
+static void status_count_handle(uint32 pb, int16 count, uint32 h)
+{
+	WriteMacInt32(pb + csParam, 6);
+	WriteMacInt16(pb + csParam + 4, count);
+	WriteMacInt32(pb + csParam + 6, h);
+}
+
+static uint32 new_handle(uint32 size)
+{
+	M68kRegisters r;
+	r.d[0] = size;
+	Execute68kTrap(0xa122, &r);	// NewHandle()
+	return r.a[0];
+}
+
+int16 SoundInStatus(uint32 pb, uint32 dce)
 {
 	uint16 code = ReadMacInt16(pb + csCode);
 	D(bug("SoundInStatus %d\n", code));
 	if (code != 2)
-		return -231;	// siUnknownInfoType
-	
-	// two choices on return
-	// 1: if under 18 bytes, place # of bytes at (pb+csParam) and write from (pb+csParam+4) on
-	// 2: if over 18 bytes, place 0 at (pb+csParam) and directly write into address pointed to by (pb+csParam+4)
-	uint32 selector = ReadMacInt32(pb + csParam); // 4-byte selector (should match via FOURCC above)
-	uint32 bufferptr = ReadMacInt32(pb + csParam + 4); // 4-byte address to the buffer in vm memory
+		return siUnknownInfoType;
+
+	uint32 selector = ReadMacInt32(pb + csParam);
+	D(bug(" selector %c%c%c%c\n", selector >> 24, (selector >> 16) & 0xff, (selector >> 8) & 0xff, selector & 0xff));
 
 	switch (selector) {
-		case siDeviceName: { // return name in STR255 format
-			const uint8 str[] = { // size 9
-				0x08,		// 1-byte length
-				0x42, 0x75, // Bu
-				0x69, 0x6c, // il
-				0x74, 0x2d, // t-
-				0x69, 0x6e  // in
-			};
-//			const uint8 str[] = { // size 12
-//                0x0b,       // 1-byte length
-//                0x53, 0x68, // Sh
-//                0x65, 0x65, // ee
-//                0x70, 0x73, // ps
-//                0x68, 0x61, // ha
-//                0x76, 0x65, // ve
-//                0x72        // r
-//			};
-			WriteMacInt32(pb + csParam, 0); // response will be written directly into buffer
+		case siDeviceName: {	// Str255, longer than 18 bytes: copy to the caller's buffer
+			uint32 bufferptr = ReadMacInt32(pb + csParam + 4);
+			static const uint8 str[] = { 8, 'B', 'u', 'i', 'l', 't', '-', 'i', 'n' };
 			Host2Mac_memcpy(bufferptr, str, sizeof(str));
-			
+			WriteMacInt32(pb + csParam, 0);
 			return noErr;
 		}
 
-		case siDeviceIcon: {
-			// todo: add soundin ICN, borrow from CD ROM for now
-			WriteMacInt32(pb + csParam, 0);
-			
-			M68kRegisters r;
-			r.d[0] = sizeof(CDROMIcon);
-			Execute68kTrap(0xa122, &r);	// NewHandle()
-			uint32 h = r.a[0];
+		case siDeviceIcon: {	// handle to 'ICN#' data; borrow the CD-ROM icon
+			uint32 h = new_handle(sizeof(CDROMIcon));
 			if (h == 0)
 				return memFullErr;
-			WriteMacInt32(bufferptr, h);
-			uint32 sp = ReadMacInt32(h);
-			Host2Mac_memcpy(sp, CDROMIcon, sizeof(CDROMIcon));
-			
-			return noErr;
-			
-			// 68k code causes crash in sheep and link error in basilisk
-//			M68kRegisters r;
-//			static const uint8 proc[] = {
-//				0x55, 0x8f,							// 	subq.l	#2,sp
-//				0xa9, 0x94,							// 	CurResFile
-//				0x42, 0x67,							// 	clr.w	-(sp)
-//				0xa9, 0x98,							// 	UseResFile
-//				0x59, 0x8f,							// 	subq.l	#4,sp
-//				0x48, 0x79, 0x49, 0x43, 0x4e, 0x23,	// 	move.l	#'ICN#',-(sp)
-//				0x3f, 0x3c, 0xbf, 0x76,				// 	move.w	#-16522,-(sp)
-//				0xa9, 0xa0,							// 	GetResource
-//				0x24, 0x5f,							// 	move.l	(sp)+,a2
-//				0xa9, 0x98,							// 	UseResFile
-//				0x20, 0x0a,							// 	move.l	a2,d0
-//				0x66, 0x04,							// 	bne		1
-//				0x70, 0x00,							//  moveq	#0,d0
-//				M68K_RTS >> 8, M68K_RTS & 0xff,
-//				0x2f, 0x0a,							//1 move.l	a2,-(sp)
-//				0xa9, 0x92,							//  DetachResource
-//				0x20, 0x4a,							//  move.l	a2,a0
-//				0xa0, 0x4a,							//	HNoPurge
-//				0x70, 0x01,							//	moveq	#1,d0
-//				M68K_RTS >> 8, M68K_RTS & 0xff
-//			};
-//			Execute68k(Host2MacAddr((uint8 *)proc), &r);
-//			if (r.d[0]) {
-//				WriteMacInt32(pb + csParam, 4); // Length of returned data
-//				WriteMacInt32(pb + csParam + 4, r.a[2]); // Handle to icon suite
-//				return noErr;
-//			} else
-//				return -192;		// resNotFound
-		}
-			
-		case siInputSource: {
-			// return -231 if only 1 or index of current source if more
-
-			WriteMacInt32(pb + csParam, 2);
-			WriteMacInt16(pb + csParam + 4, SoundInSource); // index of selected source
+			Host2Mac_memcpy(ReadMacInt32(h), CDROMIcon, sizeof(CDROMIcon));
+			status_int32(pb, h);
 			return noErr;
 		}
-			
-		case siInputSourceNames: {
-			// return -231 if only 1 or handle to STR# resource if more
-			
-			const uint8 str[] = {
-				0x00, 0x02, // 2-byte count of #strings
-				// byte size indicator (up to 255 length supported)
-				0x0a,       // size is 10
-				0x4d, 0x69,	// Mi
-				0x63, 0x72,	// cr
-				0x6f, 0x70,	// op
-				0x68, 0x6f,	// ho
-				0x6e, 0x65,	// ne
-				0x0b,		// size is 11
-				0x49, 0x6e, // start of string in ASCII, In
-				0x74, 0x65, // te
-				0x72, 0x6e, // rn
-				0x61, 0x6c, // al
-				0x20, 0x43, //  C
-				0x44,  		// D
-			};
 
-			WriteMacInt32(pb + csParam, 0);
+		case siDeviceConnected:
+			status_int16(pb, AudioInBackend ? 1 : 0);	// siDeviceIsConnected / NotConnected
+			return noErr;
 
-			M68kRegisters r;
-			r.d[0] = sizeof(str);
-			Execute68kTrap(0xa122, &r);	// NewHandle()
-			uint32 h = r.a[0];
+		case siAsync:
+			status_int16(pb, 1);
+			return noErr;
+
+		case siContinuous:
+			status_int16(pb, si.continuous);
+			return noErr;
+
+		case siPauseRecording:
+			status_int16(pb, si.paused);
+			return noErr;
+
+		case siAGCOnOff:
+			status_int16(pb, si.agc);
+			return noErr;
+
+		case siTwosComplementOnOff:
+			status_int16(pb, si.twos_complement);
+			return noErr;
+
+		case siDeviceBufferInfo:
+			status_int32(pb, 4096);
+			return noErr;
+
+		case siNumberChannels:
+			status_int16(pb, si.channels);
+			return noErr;
+
+		case siChannelAvailable:
+			status_int16(pb, 2);
+			return noErr;
+
+		case siActiveChannels:
+			status_int32(pb, (1 << si.channels) - 1);
+			return noErr;
+
+		case siSampleSize:
+			status_int16(pb, si.sample_size);
+			return noErr;
+
+		case siSampleSizeAvailable: {
+			uint32 h = new_handle(2 * 2);
 			if (h == 0)
 				return memFullErr;
-			WriteMacInt32(bufferptr, h);
-			uint32 sp = ReadMacInt32(h);
-			Host2Mac_memcpy(sp, str, sizeof(str));
-			
+			WriteMacInt16(ReadMacInt32(h), 8);
+			WriteMacInt16(ReadMacInt32(h) + 2, 16);
+			status_count_handle(pb, 2, h);
 			return noErr;
 		}
-			
-		case siOptionsDialog: {
-			// 0 if no options box supported and 1 if so
-			WriteMacInt32(pb + csParam, 2); // response not in buffer, need to copy integer
-			WriteMacInt16(pb + csParam + 4, 1); // Integer data type
+
+		case siSampleRate:
+			status_int32(pb, si.sample_rate);
 			return noErr;
-		}
-			
-		case siPlayThruOnOff: {
-			// playthrough volume, 0 is off and 7 is max
-			WriteMacInt32(pb + csParam, 2);
-			WriteMacInt16(pb + csParam + 4, SoundInPlaythrough);
-			return noErr;
-		}
-			
-		case siNumberChannels: {
-			// 1 is mono and 2 is stereo
-			WriteMacInt32(pb + csParam, 2);
-			WriteMacInt16(pb + csParam + 4, 2);
-			return noErr;
-		}
-	
-		case siSampleRate: {
-			WriteMacInt32(pb + csParam, 0);
-			WriteMacInt32(bufferptr, 0xac440000); // 44100.00000 Hz, of Fixed data type
-			return noErr;
-		}
-	
+
 		case siSampleRateAvailable: {
-			WriteMacInt32(pb + csParam, 0);
-            
-            M68kRegisters r;
-            r.d[0] = 4;
-            Execute68kTrap(0xa122, &r);    // NewHandle()
-            uint32 h = r.a[0];
-            if (h == 0)
-                return memFullErr;
-            WriteMacInt16(bufferptr, 1); // 1 sample rate available
-            WriteMacInt32(bufferptr + 2, h); // handle to sample rate list
-            uint32 sp = ReadMacInt32(h);
-            WriteMacInt32(sp, 0xac440000); // 44100.00000 Hz, of Fixed data type
+			uint32 h = new_handle(NUM_SOUNDIN_RATES * 4);
+			if (h == 0)
+				return memFullErr;
+			for (int i = 0; i < NUM_SOUNDIN_RATES; i++)
+				WriteMacInt32(ReadMacInt32(h) + i * 4, soundin_rates[i]);
+			status_count_handle(pb, NUM_SOUNDIN_RATES, h);
+			return noErr;
+		}
 
+		case siCompressionType:
+			status_int32(pb, FOURCC('N','O','N','E'));
+			return noErr;
+
+		case siCompressionFactor:
+			status_int16(pb, 1);
+			return noErr;
+
+		case siCompressionAvailable: {
+			uint32 h = new_handle(4);
+			if (h == 0)
+				return memFullErr;
+			WriteMacInt32(ReadMacInt32(h), FOURCC('N','O','N','E'));
+			status_count_handle(pb, 1, h);
 			return noErr;
 		}
-			
-		case siInputGain: {
+
+		case siRecordingQuality:
+			status_int32(pb, si.quality);
+			return noErr;
+
+		case siLevelMeterOnOff: {
+			// While not recording, drain capture to measure the current level
+			if (si.meter_on && si.device_running && !si.read_pending) {
+				uint8 tmp[4096];
+				for (int i = 0; i < 64 && soundin_host_read(tmp, sizeof(tmp)); i++)
+					;
+			}
 			WriteMacInt32(pb + csParam, 4);
-			WriteMacInt32(pb + csParam + 4, SoundInGain);
+			WriteMacInt16(pb + csParam + 4, si.meter_on);
+			WriteMacInt16(pb + csParam + 6, si.meter_on ? si.level : 0);
 			return noErr;
 		}
-								   
-			
+
+		case siInputGain:
+			status_int32(pb, si.gain);
+			return noErr;
+
+		case siInputAvailable:
+			status_int16(pb, 2);
+			return noErr;
+
+		case siInputSource:
+			status_int16(pb, si.source);
+			return noErr;
+
+		case siInputSourceNames: {	// handle to 'STR#' data
+			static const uint8 str[] = {
+				0x00, 0x02,
+				10, 'M', 'i', 'c', 'r', 'o', 'p', 'h', 'o', 'n', 'e',
+				11, 'I', 'n', 't', 'e', 'r', 'n', 'a', 'l', ' ', 'C', 'D'
+			};
+			uint32 h = new_handle(sizeof(str));
+			if (h == 0)
+				return memFullErr;
+			Host2Mac_memcpy(ReadMacInt32(h), str, sizeof(str));
+			status_int32(pb, h);
+			return noErr;
+		}
+
+		case siOptionsDialog:
+			status_int16(pb, 0);	// no options dialog
+			return noErr;
+
+		case siPlayThruOnOff:
+			status_int16(pb, si.playthrough);
+			return noErr;
+
 		default:
-			return -231;	// siUnknownInfoType
+			return siUnknownInfoType;
 	}
 }
 
@@ -829,5 +1198,8 @@ int16 SoundInStatus(uint32 pb, uint32 dce) // A0 points to Device Manager parame
 int16 SoundInClose(uint32 pb, uint32 dce)
 {
 	D(bug("SoundInClose\n"));
+	si.meter_on = false;
+	soundin_stop_recording();
+	soundin_stop_device();
 	return noErr;
 }

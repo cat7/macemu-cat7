@@ -506,6 +506,11 @@ void EmulOp(uint16 opcode, M68kRegisters *r)
 				AudioInterrupt();
 			}
 
+			if (InterruptFlags & INTFLAG_SOUNDIN) {
+				ClearInterruptFlag(INTFLAG_SOUNDIN);
+				SoundInInterrupt();
+			}
+
 			if (InterruptFlags & INTFLAG_ADB) {
 				ClearInterruptFlag(INTFLAG_ADB);
 				if (HasMacStarted())

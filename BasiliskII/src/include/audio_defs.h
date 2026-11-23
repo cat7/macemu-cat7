@@ -87,6 +87,25 @@ const uint32 siOptionsDialog        = FOURCC('o','p','t','d');  // display optio
 const uint32 siPlayThruOnOff        = FOURCC('p','l','t','h');  // play-through state
 const uint32 siInitializeDriver     = FOURCC('i','n','i','t');  // open sound input device
 const uint32 siCloseDriver          = FOURCC('c','l','o','s');  // close sound input device
+const uint32 siActiveChannels       = FOURCC('c','h','a','c');  // active channels (bitmap)
+const uint32 siActiveLevels         = FOURCC('l','m','a','c');  // levels of active channels
+const uint32 siAGCOnOff             = FOURCC('a','g','c',' ');  // automatic gain control
+const uint32 siAsync                = FOURCC('a','s','y','n');  // asynchronous recording supported
+const uint32 siCompressionAvailable = FOURCC('c','m','a','v');  // compression types available
+const uint32 siCompressionFactor    = FOURCC('c','m','f','a');  // current compression factor
+const uint32 siCompressionType      = FOURCC('c','o','m','p');  // current compression type
+const uint32 siContinuous           = FOURCC('c','o','n','t');  // continuous recording
+const uint32 siDeviceBufferInfo     = FOURCC('d','b','i','n');  // size of interrupt buffer
+const uint32 siDeviceConnected      = FOURCC('d','c','o','n');  // input device connected
+const uint32 siInputAvailable       = FOURCC('i','n','a','v');  // number of input sources
+const uint32 siLevelMeterOnOff      = FOURCC('l','m','e','t');  // level meter state and level
+const uint32 siPauseRecording       = FOURCC('p','a','u','s');  // pause recording
+const uint32 siRecordingQuality     = FOURCC('q','u','a','l');  // recording quality
+const uint32 siTwosComplementOnOff  = FOURCC('t','w','o','s');  // 8-bit two's complement
+const uint32 siUserInterruptProc    = FOURCC('u','s','e','r');  // Sound Input Manager interrupt routine
+const uint32 siBestQuality          = FOURCC('b','e','s','t');
+const uint32 siBetterQuality        = FOURCC('b','e','t','r');
+const uint32 siGoodQuality          = FOURCC('g','o','o','d');
 
 enum {	// ComponentResource struct
 	componentType = 0,

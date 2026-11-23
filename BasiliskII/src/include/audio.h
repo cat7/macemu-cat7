@@ -37,6 +37,25 @@ extern int16 SoundInControl(uint32 pb, uint32 dce);
 extern int16 SoundInStatus(uint32 pb, uint32 dce);
 extern int16 SoundInClose(uint32 pb, uint32 dce);
 
+// Sound input: interrupt handler (INTFLAG_SOUNDIN), and the call a host
+// backend makes from any thread when new recorded data is available
+extern void SoundInInterrupt(void);
+extern void SoundInDataArrived(void);
+
+// Sound input host backend. A backend that can record sets these (e.g. in
+// AudioInit); when they stay NULL the Mac sees no sound input hardware.
+// Samples are delivered in Mac format: 8 bit unsigned (offset binary) or
+// signed, 16 bit signed big-endian, interleaved when stereo.
+struct audio_in_backend {
+	bool (*start)(int rate, int bits, int channels, bool is_signed);	// open or reformat
+	void (*stop)(void);
+	uint32 (*available)(void);						// bytes ready to read
+	uint32 (*read)(uint8 *buf, uint32 len);			// non-blocking
+	void (*clear)(void);							// drop buffered data
+	void (*set_gain)(float gain);					// 1.0 = unity
+};
+extern const audio_in_backend *AudioInBackend;
+
 // System specific and internal functions/data
 extern void AudioInit(void);
 extern void AudioExit(void);

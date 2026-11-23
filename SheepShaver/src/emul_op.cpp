@@ -346,6 +346,10 @@ void EmulOp(M68kRegisters *r, uint32 pc, int selector)
 					ClearInterruptFlag(INTFLAG_AUDIO);
 					AudioInterrupt();
 				}
+				if (InterruptFlags & INTFLAG_SOUNDIN) {
+					ClearInterruptFlag(INTFLAG_SOUNDIN);
+					SoundInInterrupt();
+				}
 				if (InterruptFlags & INTFLAG_ADB) {
 					ClearInterruptFlag(INTFLAG_ADB);
 					ADBInterrupt();
