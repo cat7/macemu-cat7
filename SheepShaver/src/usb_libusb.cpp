@@ -33,19 +33,28 @@
 #include <string.h>
 #include <vector>
 #include <string>
+#include <deque>
+#include <mutex>
+#include <thread>
+#include <atomic>
 
+#include "main.h"
 #include "prefs.h"
 #include "usb_host.h"
 
 class LibUSBHost : public USBHostBackend {
 public:
-	LibUSBHost() : ctx(NULL), started(false) {}
+	LibUSBHost() : ctx(NULL), started(false), quit(false) {}
 	virtual ~LibUSBHost();
 
 	virtual int count(void) { start(); return (int)devs.size(); }
 	virtual bool low_speed(int dev) { return valid(dev) && devs[dev].low_speed; }
 	virtual const char *name(int dev) { return valid(dev) ? devs[dev].label.c_str() : "?"; }
 	virtual int control(int dev, const uint8 *setup, uint8 *data, int length);
+	virtual bool submit(int dev, uint8 ep, int type, uint8 *data, int length, uint32 tag);
+	virtual bool reap(uint32 *tag, int *result, bool *cancelled);
+	virtual void cancel(int dev, uint8 ep);
+	virtual void clear_halt(int dev, uint8 ep);
 
 private:
 	struct Device {
@@ -66,10 +75,37 @@ private:
 	libusb_context *ctx;
 	bool started;
 	std::vector<Device> devs;
+
+	// Asynchronous transfers: libusb events are handled in their own thread
+	// (Windows has no pollable libusb file descriptors); finished transfers
+	// wait in a queue until the emulator reaps them.
+	struct Pending {
+		libusb_transfer *xfer;
+		int dev;
+		uint8 ep;
+		uint32 tag;
+	};
+	struct Done {
+		uint32 tag;
+		int result;
+		bool cancelled;
+	};
+	std::mutex lock;
+	std::vector<Pending> pending;
+	std::deque<Done> done;
+	std::thread events;
+	std::atomic<bool> quit;
+	void event_loop(void);
+	static void LIBUSB_CALL transfer_done(libusb_transfer *xfer);
 };
 
 LibUSBHost::~LibUSBHost()
 {
+	if (events.joinable()) {
+		quit = true;
+		events.detach();		// at exit: do not wait for libusb
+		return;
+	}
 	for (size_t i = 0; i < devs.size(); i++) {
 		if (devs[i].handle)
 			libusb_close(devs[i].handle);
@@ -122,6 +158,96 @@ void LibUSBHost::start(void)
 		}
 	}
 	libusb_free_device_list(list, 1);
+
+	for (size_t i = 0; i < devs.size(); i++)
+		if (devs[i].handle) {
+			events = std::thread(&LibUSBHost::event_loop, this);
+			break;
+		}
+}
+
+void LibUSBHost::event_loop(void)
+{
+	while (!quit) {
+		struct timeval tv = {0, 100000};
+		libusb_handle_events_timeout_completed(ctx, &tv, NULL);
+	}
+}
+
+void LIBUSB_CALL LibUSBHost::transfer_done(libusb_transfer *xfer)
+{
+	LibUSBHost *self = (LibUSBHost *)xfer->user_data;
+	Done d;
+	d.cancelled = xfer->status == LIBUSB_TRANSFER_CANCELLED;
+	switch (xfer->status) {
+		case LIBUSB_TRANSFER_COMPLETED: d.result = xfer->actual_length; break;
+		case LIBUSB_TRANSFER_STALL: d.result = USB_HOST_STALL; break;
+		case LIBUSB_TRANSFER_CANCELLED: d.result = xfer->actual_length; break;
+		default: d.result = USB_HOST_ERROR; break;
+	}
+	std::lock_guard<std::mutex> g(self->lock);
+	for (size_t i = 0; i < self->pending.size(); i++)
+		if (self->pending[i].xfer == xfer) {
+			d.tag = self->pending[i].tag;
+			self->pending.erase(self->pending.begin() + i);
+			self->done.push_back(d);
+			SetInterruptFlag(INTFLAG_USB);		// like a host controller interrupt
+			TriggerInterrupt();
+			break;
+		}
+	libusb_free_transfer(xfer);
+}
+
+bool LibUSBHost::submit(int dev, uint8 ep, int type, uint8 *data, int length, uint32 tag)
+{
+	start();
+	if (!valid(dev) || devs[dev].handle == NULL)
+		return false;
+	libusb_transfer *xfer = libusb_alloc_transfer(0);
+	if (xfer == NULL)
+		return false;
+	if (type == INTERRUPT)
+		libusb_fill_interrupt_transfer(xfer, devs[dev].handle, ep, data, length, transfer_done, this, 0);
+	else
+		libusb_fill_bulk_transfer(xfer, devs[dev].handle, ep, data, length, transfer_done, this, 0);
+	Pending p = {xfer, dev, ep, tag};
+	{
+		std::lock_guard<std::mutex> g(lock);
+		pending.push_back(p);
+	}
+	if (libusb_submit_transfer(xfer) != 0) {
+		std::lock_guard<std::mutex> g(lock);
+		pending.pop_back();
+		libusb_free_transfer(xfer);
+		return false;
+	}
+	return true;
+}
+
+bool LibUSBHost::reap(uint32 *tag, int *result, bool *cancelled)
+{
+	std::lock_guard<std::mutex> g(lock);
+	if (done.empty())
+		return false;
+	*tag = done.front().tag;
+	*result = done.front().result;
+	*cancelled = done.front().cancelled;
+	done.pop_front();
+	return true;
+}
+
+void LibUSBHost::cancel(int dev, uint8 ep)
+{
+	std::lock_guard<std::mutex> g(lock);
+	for (size_t i = 0; i < pending.size(); i++)
+		if (pending[i].dev == dev && pending[i].ep == ep)
+			libusb_cancel_transfer(pending[i].xfer);
+}
+
+void LibUSBHost::clear_halt(int dev, uint8 ep)
+{
+	if (valid(dev) && devs[dev].handle)
+		libusb_clear_halt(devs[dev].handle, ep);
 }
 
 // Configuration descriptor as the device sends it, rebuilt from libusb's

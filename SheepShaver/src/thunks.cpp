@@ -97,6 +97,7 @@ uint32 NativeOpcode(int selector)
 	case NATIVE_GET_1_NAMED_RESOURCE:
   	case NATIVE_MAKE_EXECUTABLE:
 	case NATIVE_USB_UIM:
+	case NATIVE_USB_IRQ:
 		opcode = POWERPC_NATIVE_OP(1, selector);
 		break;
 	default:

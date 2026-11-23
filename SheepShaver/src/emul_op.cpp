@@ -350,6 +350,10 @@ void EmulOp(M68kRegisters *r, uint32 pc, int selector)
 					ClearInterruptFlag(INTFLAG_SOUNDIN);
 					SoundInInterrupt();
 				}
+				if (InterruptFlags & INTFLAG_USB) {
+					ClearInterruptFlag(INTFLAG_USB);
+					ExecuteNative(NATIVE_USB_IRQ);
+				}
 				if (InterruptFlags & INTFLAG_ADB) {
 					ClearInterruptFlag(INTFLAG_ADB);
 					ADBInterrupt();

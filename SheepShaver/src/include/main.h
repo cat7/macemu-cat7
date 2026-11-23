@@ -69,7 +69,8 @@ enum {
 	INTFLAG_AUDIO = 16,	// Audio block read
 	INTFLAG_TIMER = 32,	// Time Manager
 	INTFLAG_ADB = 64,	// ADB
-	INTFLAG_SOUNDIN = 256	// Sound input data arrived
+	INTFLAG_SOUNDIN = 256,	// Sound input data arrived
+	INTFLAG_USB = 512		// USB transfers finished (passthrough)
 };
 
 extern volatile uint32 InterruptFlags;						// Currently pending interrupts

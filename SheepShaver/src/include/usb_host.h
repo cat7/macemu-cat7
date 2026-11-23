@@ -43,6 +43,23 @@ public:
 	// data holds wLength bytes (IN: filled in, OUT: sent). Returns the
 	// number of data bytes transferred, or USB_HOST_STALL / USB_HOST_ERROR.
 	virtual int control(int dev, const uint8 *setup, uint8 *data, int length) = 0;
+
+	// Start a bulk or interrupt transfer on endpoint ep (bit 7 set: IN).
+	// data (length bytes) must stay valid until the transfer is reaped.
+	// Returns false if it could not be started. Never blocks.
+	enum { BULK = 2, INTERRUPT = 3 };
+	virtual bool submit(int dev, uint8 ep, int type, uint8 *data, int length, uint32 tag) = 0;
+
+	// Fetch one finished transfer: its tag, result (bytes transferred or
+	// USB_HOST_STALL / USB_HOST_ERROR) and whether it was cancelled.
+	// Returns false when none is waiting. Safe to call from the emulator.
+	virtual bool reap(uint32 *tag, int *result, bool *cancelled) = 0;
+
+	// Cancel the transfers on an endpoint (they are reaped as cancelled)
+	virtual void cancel(int dev, uint8 ep) = 0;
+
+	// Clear a halt (stall) on an endpoint
+	virtual void clear_halt(int dev, uint8 ep) = 0;
 };
 
 // The backend in use, or NULL when the build has none

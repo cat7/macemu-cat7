@@ -469,6 +469,10 @@ static void usb_complete(uint32 proc, uint32 refcon, int32 status, uint32 remain
 
 static void usb_deliver_completions(void)
 {
+	static bool busy = false;	// completions run Mac code, which may be interrupted
+	if (busy)
+		return;
+	busy = true;
 	while (!usb_done.empty()) {
 		usb_completion c = usb_done.front();
 		usb_done.pop_front();
@@ -478,6 +482,7 @@ static void usb_deliver_completions(void)
 		}
 		CallMacOS3(uint32 (*)(uint32, int32, uint32), c.proc, c.refcon, c.status, c.remaining);
 	}
+	busy = false;
 }
 
 
@@ -536,6 +541,8 @@ static struct {
 	uint32 int_proc, int_refcon, int_buffer, int_size;
 	int reset_port;			// port reset last: its device answers address 0
 } rh;
+
+static void usb_dev_port_reset(int port);
 
 static void rh_reset(void)
 {
@@ -618,6 +625,7 @@ static void rh_setup(const uint8 *s)
 					rh.port_status[port] |= PORT_ENABLE;
 					rh.port_change[port] |= PORT_RESET;	// reset done at once
 					rh.reset_port = port;				// its device is at address 0 now
+					usb_dev_port_reset(port);
 				} else if (value == F_PORT_SUSPEND)
 					rh.port_status[port] |= PORT_SUSPEND;
 			}
@@ -717,6 +725,15 @@ static struct usb_dev_state {
 	int32 status;			// result of a request without data stage
 } usb_devs[RH_PORTS];
 
+// A port reset puts its device back at the default address
+static void usb_dev_port_reset(int port)
+{
+	usb_devs[port].address = 0;
+	usb_devs[port].have_pending_address = false;
+	if (usb_log)
+		fprintf(usb_log, "      port %d reset: device at address 0\n", port + 1);
+}
+
 // Port whose device has this address, or -1
 static int usb_dev_port(uint32 address)
 {
@@ -789,13 +806,124 @@ static void usb_dev_control_transfer(int port, uint32 refcon, uint32 proc, uint3
 	usb_complete(proc, refcon, 0, 0);
 }
 
+/*
+ *  Bulk and interrupt transfers to passed-through devices run
+ *  asynchronously on the host; finished ones are collected on the USB
+ *  stack's polling calls and completed with their data.
+ */
+
+struct usb_xfer {
+	uint32 tag;
+	int port;
+	uint8 ep;				// endpoint address, bit 7 = IN
+	uint32 proc, refcon;	// completion
+	uint32 buffer, size;	// Mac buffer
+	std::vector<uint8> data;
+};
+static std::deque<usb_xfer *> usb_xfers;
+static uint32 usb_next_tag = 1;
+
+// v4 bulk/interrupt transfer(address, endpoint, refcon, completion, buffer, rounding, size, direction)
+static void usb_dev_data_transfer(int type, uint32 address, uint32 endpoint, uint32 refcon, uint32 proc,
+                                  uint32 buffer, uint32 size, uint32 direction)
+{
+	int port = usb_dev_port(address);
+	if (port < 0) {
+		usb_complete(proc, refcon, kUSBNotRespondingErr, size);
+		return;
+	}
+	usb_xfer *x = new usb_xfer;
+	x->tag = usb_next_tag++;
+	x->port = port;
+	x->ep = (endpoint & 0x0f) | (direction == 1 ? 0x80 : 0);
+	x->proc = proc;
+	x->refcon = refcon;
+	x->buffer = buffer;
+	x->size = size;
+	x->data.resize(size ? size : 1);
+	if (direction != 1 && size)
+		Mac2Host_memcpy(&x->data[0], buffer, size);
+	if (!USBHost->submit(port, x->ep, type, &x->data[0], size, x->tag)) {
+		// An interrupt endpoint we cannot reach (a device opened for its
+		// descriptors only) never has data: leave the transfer pending, like
+		// a device that keeps NAKing, instead of failing it (the class driver
+		// would retry at once, forever). Bulk transfers fail.
+		static int reported = 0;
+		if (usb_log && reported++ < 10)
+			fprintf(usb_log, "      port %d ep %02x: transfer not started\n", port + 1, x->ep);
+		if (type != USBHostBackend::INTERRUPT)
+			usb_complete(proc, refcon, kUSBNotRespondingErr, size);
+		delete x;
+		return;
+	}
+	usb_xfers.push_back(x);
+}
+
+// Collect finished host transfers and queue their completions
+static void usb_reap_transfers(void)
+{
+	static bool busy = false;	// the USB interrupt may arrive during a UIM call
+	if (busy)
+		return;
+	busy = true;
+	uint32 tag;
+	int result;
+	bool cancelled;
+	while (USBHost && USBHost->reap(&tag, &result, &cancelled)) {
+		for (size_t i = 0; i < usb_xfers.size(); i++) {
+			usb_xfer *x = usb_xfers[i];
+			if (x->tag != tag)
+				continue;
+			usb_xfers.erase(usb_xfers.begin() + i);
+			if (cancelled) {			// aborted by the Mac: no completion
+				delete x;
+				break;
+			}
+			int32 status = result >= 0 ? 0 : usb_host_status(result);
+			uint32 n = result >= 0 ? result : 0;
+			if ((x->ep & 0x80) && n)
+				Host2Mac_memcpy(x->buffer, &x->data[0], n);
+			if (usb_log)
+				fprintf(usb_log, "      port %d ep %02x: %s %u of %u bytes, status %d\n", x->port + 1, x->ep,
+					(x->ep & 0x80) ? "IN" : "OUT", n, x->size, status);
+			usb_complete(x->proc, x->refcon, status, x->size - n);
+			delete x;
+			break;
+		}
+	}
+	busy = false;
+}
+
+// USB interrupt (INTFLAG_USB): host transfers have finished. Mac OS may be
+// waiting for one without calling the USB stack, so complete them now, as a
+// host controller's interrupt would.
+void USBInterrupt(void)
+{
+	usb_reap_transfers();
+	usb_deliver_completions();
+}
+
+// Cancel the host transfers of an endpoint (address, endpoint, direction)
+static void usb_dev_abort(uint32 address, uint32 endpoint, uint32 direction)
+{
+	int port = usb_dev_port(address);
+	if (port < 0 || (endpoint & 0x0f) == 0)
+		return;
+	uint8 ep = (endpoint & 0x0f) | (direction == 1 ? 0x80 : 0);
+	USBHost->cancel(port, ep);
+}
+
+uint32 USBUIMResult2 = 0;		// r4 on return (64-bit results)
+
 uint32 USBUIMCall(uint32 slot, uint32 toc, uint32 ret, uint32 a1, uint32 a2, uint32 a3, uint32 a4, uint32 a5, uint32 a6, uint32 a7, uint32 a8)
 {
 	static unsigned long calls = 0;
 	if (usb_log == NULL)
 		usb_log = fopen("usb.log", "w");
 	static unsigned long frame_calls = 0;
-	bool quiet = slot == 25 && ++frame_calls > 3;	// frame number is polled constantly
+	// frame number and the v6 idle call are polled constantly
+	static unsigned long idle_calls = 0;
+	bool quiet = (slot == 25 && ++frame_calls > 3) || (slot == 28 && ++idle_calls > 3);
 	if (usb_log && calls < 5000 && !quiet) {
 		const char *name = slot < 30 && uim_slot_names[slot] ? uim_slot_names[slot] : "?";
 		fprintf(usb_log, "%5lu slot %2u %-28s", ++calls, slot, name);
@@ -807,8 +935,10 @@ uint32 USBUIMCall(uint32 slot, uint32 toc, uint32 ret, uint32 a1, uint32 a2, uin
 	}
 
 	// Polling calls from the USB stack deliver finished transfers
-	if (slot == 22 || slot == 24 || slot == 25)
+	if (slot == 22 || slot == 24 || slot == 25 || (slot == 28 && uim_version == 6)) {
+		usb_reap_transfers();
 		usb_deliver_completions();
+	}
 
 	switch (slot) {
 		case 1: {			// UIMInitialize
@@ -851,10 +981,11 @@ uint32 USBUIMCall(uint32 slot, uint32 toc, uint32 ret, uint32 a1, uint32 a2, uin
 				}
 				return 0;
 			}
-			return (uint32)frame;			// v6: returned in r3:r4 (low word only for now)
+			USBUIMResult2 = (uint32)frame;	// v6: returned in r3:r4
+			return (uint32)(frame >> 32);
 		}
-		case 4:				// UIMControlTransfer
-			if (uim_version == 4) {
+		case 4:				// UIMControlTransfer: same layout in v4 and v6
+			{
 				if (rh_addressed(a5))
 					rh_control_transfer(a1, a2, a3, a7, a8);
 				else {
@@ -866,8 +997,28 @@ uint32 USBUIMCall(uint32 slot, uint32 toc, uint32 ret, uint32 a1, uint32 a2, uin
 				}
 			}
 			return 0;
-		case 12:			// v4 UIMInterruptTransfer(address, endpoint, refcon, completion, buffer, rounding, size, direction)
-			if (uim_version == 4 && rh_addressed(a1) && a2 == 1) {
+		case 8:				// UIMBulkTransfer(refcon, completion, buffer, rounding, address, endpoint, size, direction)
+			if (USBHost)		// same layout as control, unlike interrupt
+				usb_dev_data_transfer(USBHostBackend::BULK, a5, a6, a1, a2, a3, a7, a8);
+			return 0;
+		case 19:			// UIMAbortEndpoint(address, endpoint, direction)
+		case 20:			// UIMEDDelete
+			if (USBHost && !rh_addressed(a1))
+				usb_dev_abort(a1, a2, a3);
+			return 0;
+		case 21:			// UIMClearEndPointStall(address, endpoint, direction)
+			if (USBHost && !rh_addressed(a1)) {
+				int port = usb_dev_port(a1);
+				if (port >= 0 && (a2 & 0x0f))
+					USBHost->clear_halt(port, (a2 & 0x0f) | (a3 == 1 ? 0x80 : 0));
+			}
+			return 0;
+		case 12:			// UIMInterruptTransfer, v4 and v6 (address, endpoint, refcon, completion, buffer, rounding, size, direction)
+			if (!rh_addressed(a1) && USBHost) {
+				usb_dev_data_transfer(USBHostBackend::INTERRUPT, a1, a2, a3, a4, a5, a7, a8);
+				return 0;
+			}
+			if (rh_addressed(a1) && a2 == 1) {
 				rh.int_pending = true;
 				rh.int_refcon = a3;
 				rh.int_proc = a4;
