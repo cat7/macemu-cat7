@@ -34,6 +34,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <chrono>
+#include <deque>
 
 #define DEBUG 0
 #include "debug.h"
@@ -401,9 +402,9 @@ void PatchNameRegistry(void)
  *  USB UIM dispatcher (experimental gate test)
  *
  *  Called from the UIM stub's slots with the slot number and the caller's
- *  argument registers r3-r10. For now every call is only logged to usb.log
- *  in the working directory, so the argument layout used by the real Mac OS
- *  USB stack can be read off; no transfer is completed yet.
+ *  argument registers r3-r10. Every call is logged to usb.log in the working
+ *  directory. With the ROM's USB 1.2.x stack (table version 4) the root hub
+ *  is simulated; no real devices are attached yet.
  */
 
 static const char *const uim_slot_names[30] = {
@@ -441,6 +442,244 @@ static void usb_log_word(uint32 v)
 		fprintf(usb_log, " %08x", v);
 }
 
+/*
+ *  Completions: a transfer's completion routine is called as
+ *  proc(refcon, status, bytes remaining). They are queued and delivered on
+ *  the USB stack's next polling call (frame number, periodic task), never
+ *  from inside the transfer call that queued them.
+ */
+
+struct usb_completion {
+	uint32 proc;			// TVector
+	uint32 refcon;
+	int32 status;
+	uint32 remaining;		// bytes not transferred
+};
+static std::deque<usb_completion> usb_done;
+
+static void usb_complete(uint32 proc, uint32 refcon, int32 status, uint32 remaining)
+{
+	usb_completion c = {proc, refcon, status, remaining};
+	usb_done.push_back(c);
+}
+
+static void usb_deliver_completions(void)
+{
+	while (!usb_done.empty()) {
+		usb_completion c = usb_done.front();
+		usb_done.pop_front();
+		if (usb_log) {
+			fprintf(usb_log, "      -> completion %08x(refcon %08x, status %d, remaining %u)\n", c.proc, c.refcon, c.status, c.remaining);
+			fflush(usb_log);
+		}
+		CallMacOS3(uint32 (*)(uint32, int32, uint32), c.proc, c.refcon, c.status, c.remaining);
+	}
+}
+
+
+/*
+ *  Root hub simulation: a full-speed hub with RH_PORTS ports, nothing
+ *  connected yet. It answers standard and hub class requests on its control
+ *  endpoint and reports port changes on interrupt endpoint 1.
+ */
+
+const int RH_PORTS = 4;
+
+enum {	// wPortStatus / wPortChange bits
+	PORT_CONNECTION = 0x0001, PORT_ENABLE = 0x0002, PORT_SUSPEND = 0x0004,
+	PORT_OVER_CURRENT = 0x0008, PORT_RESET = 0x0010, PORT_POWER = 0x0100, PORT_LOW_SPEED = 0x0200
+};
+enum {	// hub port feature selectors
+	F_PORT_ENABLE = 1, F_PORT_SUSPEND = 2, F_PORT_RESET = 4, F_PORT_POWER = 8,
+	F_C_PORT_CONNECTION = 16, F_C_PORT_ENABLE = 17, F_C_PORT_SUSPEND = 18,
+	F_C_PORT_OVER_CURRENT = 19, F_C_PORT_RESET = 20
+};
+
+static const uint8 rh_device_desc[18] = {
+	18, 1, 0x10, 0x01,		// USB 1.1
+	9, 0, 0,				// class hub
+	8,						// max packet size 0
+	0xac, 0x05, 0x05, 0x80,	// vendor 0x05ac, product 0x8005 (root hub)
+	0x00, 0x01,				// release 1.00
+	0, 0, 0,				// no strings
+	1						// one configuration
+};
+
+static const uint8 rh_config_desc[25] = {
+	9, 2, 25, 0, 1, 1, 0, 0xc0, 0,			// configuration: 1 interface, self-powered
+	9, 4, 0, 0, 1, 9, 0, 0, 0,				// interface: 1 endpoint, class hub
+	7, 5, 0x81, 3, 8, 0, 255				// endpoint 1 IN, interrupt, 8 bytes
+};
+
+static const uint8 rh_hub_desc[9] = {
+	9, 0x29, RH_PORTS,
+	0x02, 0x00,				// no power switching, ganged over-current
+	1, 0,					// power-on to power-good 2 ms, no controller current
+	0x00, 0xff				// no fixed devices, port power control mask
+};
+
+static struct {
+	uint8 address;			// 0 until SET_ADDRESS completes
+	uint8 pending_address;
+	bool have_pending_address;
+	uint8 config;
+	uint8 setup[8];
+	uint8 response[64];
+	uint32 response_len;
+	uint16 port_status[RH_PORTS];
+	uint16 port_change[RH_PORTS];
+	bool int_pending;		// status change interrupt transfer waiting
+	uint32 int_proc, int_refcon, int_buffer, int_size;
+} rh;
+
+static void rh_reset(void)
+{
+	memset(&rh, 0, sizeof(rh));
+	for (int i = 0; i < RH_PORTS; i++)
+		rh.port_status[i] = PORT_POWER;
+}
+
+static void rh_respond(const uint8 *data, uint32 len, uint16 wLength)
+{
+	rh.response_len = len < wLength ? len : wLength;
+	if (rh.response_len > sizeof(rh.response))
+		rh.response_len = sizeof(rh.response);
+	memcpy(rh.response, data, rh.response_len);
+}
+
+// Decode a setup packet and prepare the data stage, applying side effects
+static void rh_setup(const uint8 *s)
+{
+	uint8 type = s[0], req = s[1];
+	uint16 value = s[2] | (s[3] << 8), index = s[4] | (s[5] << 8), length = s[6] | (s[7] << 8);
+	rh.response_len = 0;
+	int port = index - 1;
+	bool port_ok = port >= 0 && port < RH_PORTS;
+	uint8 buf[4];
+
+	switch ((type << 8) | req) {
+		case 0x8006:		// GET_DESCRIPTOR (device)
+		case 0xa006:		// GET_DESCRIPTOR (hub class)
+			switch (value >> 8) {
+				case 1: rh_respond(rh_device_desc, sizeof(rh_device_desc), length); break;
+				case 2: rh_respond(rh_config_desc, sizeof(rh_config_desc), length); break;
+				case 0x29: case 0: rh_respond(rh_hub_desc, sizeof(rh_hub_desc), length); break;
+			}
+			break;
+		case 0x8000:		// GET_STATUS (device): self-powered
+			buf[0] = 1; buf[1] = 0;
+			rh_respond(buf, 2, length);
+			break;
+		case 0x8100: case 0x8200:	// GET_STATUS (interface, endpoint)
+			buf[0] = buf[1] = 0;
+			rh_respond(buf, 2, length);
+			break;
+		case 0xa000:		// GET_STATUS (hub)
+			memset(buf, 0, 4);
+			rh_respond(buf, 4, length);
+			break;
+		case 0xa300:		// GET_STATUS (port)
+			if (port_ok) {
+				buf[0] = rh.port_status[port] & 0xff; buf[1] = rh.port_status[port] >> 8;
+				buf[2] = rh.port_change[port] & 0xff; buf[3] = rh.port_change[port] >> 8;
+				rh_respond(buf, 4, length);
+			}
+			break;
+		case 0x8008:		// GET_CONFIGURATION
+			rh_respond(&rh.config, 1, length);
+			break;
+		case 0x0005:		// SET_ADDRESS, effective after the status stage
+			rh.pending_address = value & 0x7f;
+			rh.have_pending_address = true;
+			break;
+		case 0x0009:		// SET_CONFIGURATION
+			rh.config = value & 0xff;
+			break;
+		case 0x2303:		// SET_FEATURE (port)
+			if (port_ok) {
+				if (value == F_PORT_POWER)
+					rh.port_status[port] |= PORT_POWER;
+				else if (value == F_PORT_RESET && (rh.port_status[port] & PORT_CONNECTION)) {
+					rh.port_status[port] |= PORT_ENABLE;
+					rh.port_change[port] |= PORT_RESET;	// reset done at once
+				} else if (value == F_PORT_SUSPEND)
+					rh.port_status[port] |= PORT_SUSPEND;
+			}
+			break;
+		case 0x2301:		// CLEAR_FEATURE (port)
+			if (port_ok) {
+				switch (value) {
+					case F_PORT_ENABLE: rh.port_status[port] &= ~PORT_ENABLE; break;
+					case F_PORT_SUSPEND: rh.port_status[port] &= ~PORT_SUSPEND; break;
+					case F_PORT_POWER: rh.port_status[port] &= ~PORT_POWER; break;
+					case F_C_PORT_CONNECTION: rh.port_change[port] &= ~PORT_CONNECTION; break;
+					case F_C_PORT_ENABLE: rh.port_change[port] &= ~PORT_ENABLE; break;
+					case F_C_PORT_SUSPEND: rh.port_change[port] &= ~PORT_SUSPEND; break;
+					case F_C_PORT_OVER_CURRENT: rh.port_change[port] &= ~PORT_OVER_CURRENT; break;
+					case F_C_PORT_RESET: rh.port_change[port] &= ~PORT_RESET; break;
+				}
+			}
+			break;
+		default:			// SET_FEATURE/CLEAR_FEATURE (device, hub) and others: accept
+			break;
+	}
+	if (usb_log)
+		fprintf(usb_log, "      root hub request %02x %02x value %04x index %04x length %u -> %u bytes\n",
+			type, req, value, index, length, rh.response_len);
+}
+
+// Complete the status change interrupt transfer if a port has changed
+static void rh_check_status_change(void)
+{
+	if (!rh.int_pending)
+		return;
+	uint8 bitmap = 0;
+	for (int i = 0; i < RH_PORTS; i++)
+		if (rh.port_change[i])
+			bitmap |= 1 << (i + 1);
+	if (bitmap == 0)
+		return;
+	uint32 n = rh.int_size ? 1 : 0;
+	if (n)
+		WriteMacInt8(rh.int_buffer, bitmap);
+	rh.int_pending = false;
+	usb_complete(rh.int_proc, rh.int_refcon, 0, rh.int_size - n);
+}
+
+// Is this transfer for the root hub? Address 0 belongs to it until it has
+// been given its own address (no real devices are attached yet).
+static bool rh_addressed(uint32 address)
+{
+	return address == rh.address;
+}
+
+// v4 UIMControlTransfer(refcon, completion, buffer, rounding, address, endpoint, size, direction)
+// direction: 0 OUT, 1 IN, 2 SETUP
+static void rh_control_transfer(uint32 refcon, uint32 proc, uint32 buffer, uint32 size, uint32 direction)
+{
+	uint32 remaining = 0;
+	if (direction == 2) {					// setup stage
+		for (int i = 0; i < 8; i++)
+			rh.setup[i] = ReadMacInt8(buffer + i);
+		rh_setup(rh.setup);
+		remaining = size > 8 ? size - 8 : 0;
+	} else if (size > 0 && direction == 1) {	// IN data stage
+		uint32 n = rh.response_len < size ? rh.response_len : size;
+		Host2Mac_memcpy(buffer, rh.response, n);
+		remaining = size - n;
+	} else if (size > 0) {					// OUT data stage: ignored
+		remaining = 0;
+	} else {								// status stage
+		if (rh.have_pending_address) {
+			rh.address = rh.pending_address;
+			rh.have_pending_address = false;
+			if (usb_log)
+				fprintf(usb_log, "      root hub address is now %u\n", rh.address);
+		}
+	}
+	usb_complete(proc, refcon, 0, remaining);
+}
+
 uint32 USBUIMCall(uint32 slot, uint32 toc, uint32 ret, uint32 a1, uint32 a2, uint32 a3, uint32 a4, uint32 a5, uint32 a6, uint32 a7, uint32 a8)
 {
 	static unsigned long calls = 0;
@@ -458,6 +697,10 @@ uint32 USBUIMCall(uint32 slot, uint32 toc, uint32 ret, uint32 a1, uint32 a2, uin
 		fflush(usb_log);
 	}
 
+	// Polling calls from the USB stack deliver finished transfers
+	if (slot == 22 || slot == 24 || slot == 25)
+		usb_deliver_completions();
+
 	switch (slot) {
 		case 1: {			// UIMInitialize
 			// Give the dispatch table the version the loading USB stack
@@ -466,6 +709,8 @@ uint32 USBUIMCall(uint32 slot, uint32 toc, uint32 ret, uint32 a1, uint32 a2, uin
 			uint32 version = (ret >= ROMBase && ret < ROMBase + ROM_SIZE) ? 4 : 6;
 			WriteMacInt32(toc + USB_UIM_TABLE_OFFSET, version);
 			uim_version = version;
+			rh_reset();
+			usb_done.clear();
 			// The USB-to-ADB shim that Mac OS starts once a USB bus exists
 			// calls the keyboard hook in ExpandMem+0x294 and chains to it.
 			// SheepShaver's emulated ADB never sets that hook, so give it a
@@ -498,6 +743,22 @@ uint32 USBUIMCall(uint32 slot, uint32 toc, uint32 ret, uint32 a1, uint32 a2, uin
 			}
 			return (uint32)frame;			// v6: returned in r3:r4 (low word only for now)
 		}
+		case 4:				// UIMControlTransfer
+			if (uim_version == 4 && rh_addressed(a5))
+				rh_control_transfer(a1, a2, a3, a7, a8);
+			return 0;
+		case 12:			// v4 UIMInterruptTransfer(address, endpoint, refcon, completion, buffer, rounding, size, direction)
+			if (uim_version == 4 && rh_addressed(a1) && a2 == 1) {
+				rh.int_pending = true;
+				rh.int_refcon = a3;
+				rh.int_proc = a4;
+				rh.int_buffer = a5;
+				rh.int_size = a7;
+				if (usb_log)
+					fprintf(usb_log, "      root hub status change transfer pending (%u bytes)\n", a7);
+				rh_check_status_change();
+			}
+			return 0;
 		case 29:			// available bandwidth (bytes per frame), full-speed bus
 			return 1500;
 		default:			// noErr; transfers stay pending for now
