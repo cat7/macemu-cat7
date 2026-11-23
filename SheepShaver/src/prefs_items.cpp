@@ -52,6 +52,7 @@ prefs_desc common_prefs_items[] = {
 	{"nonet", TYPE_BOOLEAN, false,      "don't use Ethernet"},
 	{"nosound", TYPE_BOOLEAN, false,    "don't enable sound output"},
 	{"usbuim", TYPE_BOOLEAN, false,     "install the experimental USB UIM (logs to usb.log)"},
+	{"usbdevice", TYPE_STRING, true,    "host USB device to pass through, VVVV:PPPP (needs usbuim)"},
 	{"nogui", TYPE_BOOLEAN, false,      "disable GUI"},
 	{"noclipconversion", TYPE_BOOLEAN, false, "don't convert clipboard contents"},
 	{"ignoresegv", TYPE_BOOLEAN, false, "ignore illegal memory accesses"},

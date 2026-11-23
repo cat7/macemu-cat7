@@ -30,11 +30,13 @@
 #include "prefs.h"
 #include "xlowmem.h"
 #include "cpu_emulation.h"
+#include "usb_host.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <chrono>
 #include <deque>
+#include <vector>
 
 #define DEBUG 0
 #include "debug.h"
@@ -416,6 +418,8 @@ static const char *const uim_slot_names[30] = {
 	"FrameNumber", "UIMTransactionDataRemaining", "UIMKillRemainingTransaction", "Watchdog", "Bandwidth"
 };
 
+USBHostBackend *USBHost = NULL;	// set by the host USB backend, if the build has one
+
 static FILE *usb_log = NULL;
 static uint32 uim_version = 6;		// dispatch table version of the loading USB stack
 
@@ -530,13 +534,24 @@ static struct {
 	uint16 port_change[RH_PORTS];
 	bool int_pending;		// status change interrupt transfer waiting
 	uint32 int_proc, int_refcon, int_buffer, int_size;
+	int reset_port;			// port reset last: its device answers address 0
 } rh;
 
 static void rh_reset(void)
 {
 	memset(&rh, 0, sizeof(rh));
+	rh.reset_port = -1;
 	for (int i = 0; i < RH_PORTS; i++)
 		rh.port_status[i] = PORT_POWER;
+
+	// Passed-through host devices: one per port, connected from the start
+	int n = USBHost ? USBHost->count() : 0;
+	for (int i = 0; i < n && i < RH_PORTS; i++) {
+		rh.port_status[i] |= PORT_CONNECTION | (USBHost->low_speed(i) ? PORT_LOW_SPEED : 0);
+		rh.port_change[i] |= PORT_CONNECTION;
+		if (usb_log)
+			fprintf(usb_log, "      port %d: %s\n", i + 1, USBHost->name(i));
+	}
 }
 
 static void rh_respond(const uint8 *data, uint32 len, uint16 wLength)
@@ -602,6 +617,7 @@ static void rh_setup(const uint8 *s)
 				else if (value == F_PORT_RESET && (rh.port_status[port] & PORT_CONNECTION)) {
 					rh.port_status[port] |= PORT_ENABLE;
 					rh.port_change[port] |= PORT_RESET;	// reset done at once
+					rh.reset_port = port;				// its device is at address 0 now
 				} else if (value == F_PORT_SUSPEND)
 					rh.port_status[port] |= PORT_SUSPEND;
 			}
@@ -678,6 +694,99 @@ static void rh_control_transfer(uint32 refcon, uint32 proc, uint32 buffer, uint3
 		}
 	}
 	usb_complete(proc, refcon, 0, remaining);
+	rh_check_status_change();		// a port feature may have changed something
+}
+
+
+/*
+ *  Passed-through devices: control transfers are forwarded to the host
+ *  device, one phase per call like for the root hub. SET_ADDRESS is handled
+ *  here (the host device keeps its own address).
+ */
+
+enum {
+	kUSBEndpointStallErr = -6912,
+	kUSBNotRespondingErr = -6911
+};
+
+static struct usb_dev_state {
+	uint8 address;			// assigned by the Mac (0 = default address)
+	uint8 pending_address;
+	bool have_pending_address;
+	uint8 setup[8];
+	int32 status;			// result of a request without data stage
+} usb_devs[RH_PORTS];
+
+// Port whose device has this address, or -1
+static int usb_dev_port(uint32 address)
+{
+	if (address == 0)
+		return rh.reset_port >= 0 && usb_devs[rh.reset_port].address == 0 ? rh.reset_port : -1;
+	for (int i = 0; i < RH_PORTS; i++)
+		if (usb_devs[i].address == address && (rh.port_status[i] & PORT_CONNECTION))
+			return i;
+	return -1;
+}
+
+static int32 usb_host_status(int r)
+{
+	return r == USB_HOST_STALL ? kUSBEndpointStallErr : kUSBNotRespondingErr;
+}
+
+static void usb_dev_control_transfer(int port, uint32 refcon, uint32 proc, uint32 buffer, uint32 size, uint32 direction)
+{
+	usb_dev_state &d = usb_devs[port];
+	uint16 length = d.setup[6] | (d.setup[7] << 8);
+
+	if (direction == 2) {					// setup stage
+		for (int i = 0; i < 8; i++)
+			d.setup[i] = ReadMacInt8(buffer + i);
+		length = d.setup[6] | (d.setup[7] << 8);
+		d.status = 0;
+		if (d.setup[0] == 0x00 && d.setup[1] == 0x05) {		// SET_ADDRESS
+			d.pending_address = d.setup[2] & 0x7f;
+			d.have_pending_address = true;
+		} else if (length == 0) {			// no data stage: run it now
+			int r = USBHost->control(port, d.setup, NULL, 0);
+			if (r < 0)
+				d.status = usb_host_status(r);
+		}
+		if (usb_log)
+			fprintf(usb_log, "      port %d request %02x %02x %02x%02x %02x%02x length %u%s\n", port + 1,
+				d.setup[0], d.setup[1], d.setup[3], d.setup[2], d.setup[5], d.setup[4], length,
+				d.status ? " -> error" : "");
+		usb_complete(proc, refcon, d.status, 0);
+		return;
+	}
+
+	if (size > 0) {							// data stage
+		std::vector<uint8> data(size);
+		uint32 n = size < length ? size : length;
+		if (direction == 0)
+			Mac2Host_memcpy(&data[0], buffer, n);
+		int r = USBHost->control(port, d.setup, &data[0], n);
+		if (r < 0) {
+			if (usb_log)
+				fprintf(usb_log, "      port %d data stage failed (%d)\n", port + 1, r);
+			usb_complete(proc, refcon, usb_host_status(r), size);
+			return;
+		}
+		if (direction == 1)
+			Host2Mac_memcpy(buffer, &data[0], r);
+		if (usb_log)
+			fprintf(usb_log, "      port %d %s %d bytes\n", port + 1, direction == 1 ? "IN" : "OUT", r);
+		usb_complete(proc, refcon, 0, size - r);
+		return;
+	}
+
+	// status stage
+	if (d.have_pending_address) {
+		d.address = d.pending_address;
+		d.have_pending_address = false;
+		if (usb_log)
+			fprintf(usb_log, "      port %d device address is now %u\n", port + 1, d.address);
+	}
+	usb_complete(proc, refcon, 0, 0);
 }
 
 uint32 USBUIMCall(uint32 slot, uint32 toc, uint32 ret, uint32 a1, uint32 a2, uint32 a3, uint32 a4, uint32 a5, uint32 a6, uint32 a7, uint32 a8)
@@ -710,6 +819,7 @@ uint32 USBUIMCall(uint32 slot, uint32 toc, uint32 ret, uint32 a1, uint32 a2, uin
 			WriteMacInt32(toc + USB_UIM_TABLE_OFFSET, version);
 			uim_version = version;
 			rh_reset();
+			memset(usb_devs, 0, sizeof(usb_devs));
 			usb_done.clear();
 			// The USB-to-ADB shim that Mac OS starts once a USB bus exists
 			// calls the keyboard hook in ExpandMem+0x294 and chains to it.
@@ -744,8 +854,17 @@ uint32 USBUIMCall(uint32 slot, uint32 toc, uint32 ret, uint32 a1, uint32 a2, uin
 			return (uint32)frame;			// v6: returned in r3:r4 (low word only for now)
 		}
 		case 4:				// UIMControlTransfer
-			if (uim_version == 4 && rh_addressed(a5))
-				rh_control_transfer(a1, a2, a3, a7, a8);
+			if (uim_version == 4) {
+				if (rh_addressed(a5))
+					rh_control_transfer(a1, a2, a3, a7, a8);
+				else {
+					int port = USBHost ? usb_dev_port(a5) : -1;
+					if (port >= 0)
+						usb_dev_control_transfer(port, a1, a2, a3, a7, a8);
+					else
+						usb_complete(a2, a1, kUSBNotRespondingErr, a7);	// nothing at that address
+				}
+			}
 			return 0;
 		case 12:			// v4 UIMInterruptTransfer(address, endpoint, refcon, completion, buffer, rounding, size, direction)
 			if (uim_version == 4 && rh_addressed(a1) && a2 == 1) {

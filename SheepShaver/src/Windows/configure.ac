@@ -295,6 +295,19 @@ else
 fi
 AC_SUBST(SDL_CFLAGS)
 AC_SUBST(SDL_LIBS)
+
+dnl libusb (optional): pass host USB devices through to the Mac
+LIBUSB_CFLAGS=""
+LIBUSB_LIBS=""
+have_libusb=no
+if pkg-config --exists libusb-1.0; then
+  LIBUSB_CFLAGS=`pkg-config libusb-1.0 --cflags`
+  LIBUSB_LIBS=`pkg-config libusb-1.0 --static --libs`
+  have_libusb=yes
+  AC_DEFINE(HAVE_LIBUSB, 1, [Define to pass host USB devices through with libusb])
+fi
+AC_SUBST(LIBUSB_CFLAGS)
+AC_SUBST(LIBUSB_LIBS)
 AC_DEFINE(USE_SDL, 1, [Define to enable SDL support])
 AC_DEFINE(USE_SDL_VIDEO, 1, [Define to enable SDL video graphics support])
 AC_DEFINE(USE_SDL_AUDIO, 1, [Define to enable SDL audio support])
@@ -323,6 +336,7 @@ echo SDL major-version ................ : $WANT_SDL_VERSION_MAJOR
 echo Enable JIT compiler .............. : $WANT_JIT
 echo GTK user interface ............... : $WANT_GTK
 echo BINCUE support ................... : $have_bincue
+echo USB passthrough via libusb ....... : $have_libusb
 echo Enable VOSF ...................... : $WANT_VOSF
 echo
 echo "Configuration done. Now type \"make\"."
