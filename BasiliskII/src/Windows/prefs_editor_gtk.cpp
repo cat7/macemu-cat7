@@ -55,6 +55,11 @@ static void create_serial_pane(GtkWidget *top);
 static void create_ethernet_pane(GtkWidget *top);
 static void create_memory_pane(GtkWidget *top);
 static void create_jit_pane(GtkWidget *top);
+#ifdef SHEEPSHAVER
+static void create_usb_pane(GtkWidget *top);
+static void read_usb_settings(void);
+static void usb_bind_on_start(void);
+#endif
 static void read_settings(void);
 static void add_volume_entry_with_type(const char * filename, bool cdrom);
 static void add_volume_entry_guessed(const char * filename);
@@ -424,6 +429,9 @@ static void cb_start(...)
 	start_clicked = true;
 	read_settings();
 	SavePrefs();
+#ifdef SHEEPSHAVER
+	usb_bind_on_start();
+#endif
 	gtk_widget_destroy(win);
 }
 
@@ -557,6 +565,9 @@ bool PrefsEditor(void)
 	create_ethernet_pane(notebook);
 	create_memory_pane(notebook);
 	create_jit_pane(notebook);
+#ifdef SHEEPSHAVER
+	create_usb_pane(notebook);
+#endif
 
 	static const opt_desc buttons[] = {
 		{STR_START_BUTTON, GTK_SIGNAL_FUNC(cb_start)},
@@ -2199,6 +2210,325 @@ static void create_memory_pane(GtkWidget *top)
  *  Read settings from widgets and set preferences
  */
 
+#ifdef SHEEPSHAVER
+/*
+ *  "USB" pane: choose host USB devices to pass through to Mac OS
+ *
+ *  The device list comes from winusb-switch.exe (our 64-bit helper next to
+ *  SheepShaver.exe), which also moves the chosen devices to WinUSB, the
+ *  driver libusb needs, and back. It is run elevated for that, once for
+ *  all devices.
+ */
+
+#include <string>
+#include <vector>
+
+enum {
+	USB_COL_PASS,		// passed through (a "usbdevice" pref)
+	USB_COL_CAN,		// can be passed through
+	USB_COL_NAME,
+	USB_COL_ID,			// VVVV:PPPP
+	USB_COL_STATE,		// its Windows driver
+	USB_COL_WINUSB,		// on WinUSB now
+	USB_COL_OURS,		// put on WinUSB by winusb-switch
+	USB_N_COLS
+};
+
+static GtkListStore *usb_list_model;
+static GtkWidget *usb_list;
+
+static std::string usb_helper_path(void)
+{
+	char path[MAX_PATH];
+	DWORD n = GetModuleFileNameA(NULL, path, sizeof(path));
+	if (n == 0 || n >= sizeof(path))
+		return "";
+	std::string s(path);
+	size_t slash = s.find_last_of("\\/");
+	s = (slash == std::string::npos ? std::string() : s.substr(0, slash + 1)) + "winusb-switch.exe";
+	return GetFileAttributesA(s.c_str()) == INVALID_FILE_ATTRIBUTES ? "" : s;
+}
+
+// Value of "key" in one line of winusb-switch's JSON output
+static std::string json_value(const std::string &line, const char *key)
+{
+	std::string k = std::string("\"") + key + "\":";
+	size_t p = line.find(k);
+	if (p == std::string::npos)
+		return "";
+	p += k.size();
+	std::string v;
+	if (p < line.size() && line[p] == '"') {
+		for (p++; p < line.size() && line[p] != '"'; p++) {
+			if (line[p] == '\\' && p + 1 < line.size())
+				p++;
+			v += line[p];
+		}
+	} else {
+		while (p < line.size() && line[p] != ',' && line[p] != '}')
+			v += line[p++];
+	}
+	return v;
+}
+
+// Run the helper without a window and collect its output
+static bool usb_run_list(std::vector<std::string> &lines)
+{
+	std::string helper = usb_helper_path();
+	if (helper.empty())
+		return false;
+	SECURITY_ATTRIBUTES sa = {sizeof(sa), NULL, TRUE};
+	HANDLE rd, wr;
+	if (!CreatePipe(&rd, &wr, &sa, 0))
+		return false;
+	SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+	STARTUPINFOA si;
+	ZeroMemory(&si, sizeof(si));
+	si.cb = sizeof(si);
+	si.dwFlags = STARTF_USESTDHANDLES;
+	si.hStdOutput = wr;
+	si.hStdError = wr;
+	PROCESS_INFORMATION pi;
+	std::string cmd = "\"" + helper + "\" list";
+	std::vector<char> cmdline(cmd.begin(), cmd.end());
+	cmdline.push_back(0);
+	BOOL ok = CreateProcessA(NULL, &cmdline[0], NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+	CloseHandle(wr);
+	if (!ok) {
+		CloseHandle(rd);
+		return false;
+	}
+	std::string out;
+	char buf[4096];
+	DWORD got;
+	while (ReadFile(rd, buf, sizeof(buf), &got, NULL) && got)
+		out.append(buf, got);
+	CloseHandle(rd);
+	WaitForSingleObject(pi.hProcess, 10000);
+	CloseHandle(pi.hProcess);
+	CloseHandle(pi.hThread);
+	size_t start = 0, end;
+	while ((end = out.find('\n', start)) != std::string::npos) {
+		lines.push_back(out.substr(start, end - start));
+		start = end + 1;
+	}
+	return true;
+}
+
+static bool usb_pref_has(const std::string &id)
+{
+	const char *str;
+	for (int i = 0; (str = PrefsFindString("usbdevice", i)) != NULL; i++)
+		if (strcasecmp(str, id.c_str()) == 0)
+			return true;
+	return false;
+}
+
+// Fill the list: the host's USB devices, plus chosen devices not plugged in
+static void usb_refresh(void)
+{
+	gtk_list_store_clear(usb_list_model);
+	std::vector<std::string> lines, seen;
+	usb_run_list(lines);
+	GtkTreeIter iter;
+	for (size_t i = 0; i < lines.size(); i++) {
+		std::string id = json_value(lines[i], "id");
+		std::string refuse = json_value(lines[i], "refuse");
+		if (id.empty() || refuse == "hub")
+			continue;
+		bool dup = false;
+		for (size_t j = 0; j < seen.size(); j++)
+			dup |= seen[j] == id;
+		if (dup)
+			continue;
+		seen.push_back(id);
+		std::string name = json_value(lines[i], "product");
+		if (name.empty())
+			name = json_value(lines[i], "description");
+		bool winusb = json_value(lines[i], "winusb") == "true";
+		bool ours = json_value(lines[i], "provider") == "winusb-switch";
+		bool can = winusb || refuse.empty() || refuse == "in use";
+		std::string state = winusb ? "WinUSB (ready)" : json_value(lines[i], "service");
+		if (!refuse.empty() && !winusb)
+			state += " (" + refuse + ")";
+		gtk_list_store_append(usb_list_model, &iter);
+		gtk_list_store_set(usb_list_model, &iter,
+			USB_COL_PASS, (gboolean)(can && usb_pref_has(id)), USB_COL_CAN, (gboolean)can,
+			USB_COL_NAME, name.c_str(), USB_COL_ID, id.c_str(), USB_COL_STATE, state.c_str(),
+			USB_COL_WINUSB, (gboolean)winusb, USB_COL_OURS, (gboolean)ours, -1);
+	}
+	const char *str;
+	for (int i = 0; (str = PrefsFindString("usbdevice", i)) != NULL; i++) {
+		bool listed = false;
+		for (size_t j = 0; j < seen.size(); j++)
+			listed |= strcasecmp(seen[j].c_str(), str) == 0;
+		if (listed)
+			continue;
+		gtk_list_store_append(usb_list_model, &iter);
+		gtk_list_store_set(usb_list_model, &iter,
+			USB_COL_PASS, TRUE, USB_COL_CAN, TRUE,
+			USB_COL_NAME, "(not plugged in)", USB_COL_ID, str, USB_COL_STATE, "",
+			USB_COL_WINUSB, FALSE, USB_COL_OURS, FALSE, -1);
+	}
+}
+
+// Prefs from the list: one "usbdevice" per ticked device
+static void read_usb_settings(void)
+{
+	while (PrefsFindString("usbdevice"))
+		PrefsRemoveItem("usbdevice");
+	GtkTreeIter iter;
+	gboolean more = gtk_tree_model_get_iter_first(GTK_TREE_MODEL(usb_list_model), &iter);
+	while (more) {
+		gboolean pass;
+		gchar *id;
+		gtk_tree_model_get(GTK_TREE_MODEL(usb_list_model), &iter, USB_COL_PASS, &pass, USB_COL_ID, &id, -1);
+		if (pass)
+			PrefsAddString("usbdevice", id);
+		g_free(id);
+		more = gtk_tree_model_iter_next(GTK_TREE_MODEL(usb_list_model), &iter);
+	}
+}
+
+static void usb_pass_toggled(GtkCellRendererToggle *cell, gchar *path_str, gpointer data)
+{
+	GtkTreeIter iter;
+	if (!gtk_tree_model_get_iter_from_string(GTK_TREE_MODEL(usb_list_model), &iter, path_str))
+		return;
+	gboolean pass, can;
+	gtk_tree_model_get(GTK_TREE_MODEL(usb_list_model), &iter, USB_COL_PASS, &pass, USB_COL_CAN, &can, -1);
+	if (can)
+		gtk_list_store_set(usb_list_model, &iter, USB_COL_PASS, !pass, -1);
+	read_usb_settings();
+}
+
+// Run winusb-switch elevated (one administrator prompt) with the given
+// commands, e.g. "bind 26bd:9917", and wait for it
+static void usb_run_elevated(const std::vector<std::string> &cmds)
+{
+	std::string helper = usb_helper_path();
+	if (helper.empty() || cmds.empty())
+		return;
+	std::string params = "/s /c \"";
+	for (size_t i = 0; i < cmds.size(); i++)
+		params += (i ? " & \"" : "\"") + helper + "\" " + cmds[i];
+	params += "\"";
+	SHELLEXECUTEINFOA sei;
+	ZeroMemory(&sei, sizeof(sei));
+	sei.cbSize = sizeof(sei);
+	sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+	sei.lpVerb = "runas";
+	sei.lpFile = "cmd.exe";
+	sei.lpParameters = params.c_str();
+	sei.nShow = SW_HIDE;
+	if (ShellExecuteExA(&sei) && sei.hProcess) {
+		WaitForSingleObject(sei.hProcess, 120000);
+		CloseHandle(sei.hProcess);
+	}
+}
+
+// Start: move the ticked devices that are not on WinUSB yet to WinUSB
+static void usb_bind_on_start(void)
+{
+	if (!PrefsFindBool("usbuim"))
+		return;
+	std::vector<std::string> cmds;
+	GtkTreeIter iter;
+	gboolean more = gtk_tree_model_get_iter_first(GTK_TREE_MODEL(usb_list_model), &iter);
+	while (more) {
+		gboolean pass, winusb;
+		gchar *id, *state;
+		gtk_tree_model_get(GTK_TREE_MODEL(usb_list_model), &iter, USB_COL_PASS, &pass,
+			USB_COL_WINUSB, &winusb, USB_COL_ID, &id, USB_COL_STATE, &state, -1);
+		if (pass && !winusb && state[0])		// plugged in, still on its Windows driver
+			cmds.push_back(std::string("bind ") + id);
+		g_free(id);
+		g_free(state);
+		more = gtk_tree_model_iter_next(GTK_TREE_MODEL(usb_list_model), &iter);
+	}
+	usb_run_elevated(cmds);
+}
+
+static void cb_usb_refresh(...)
+{
+	usb_refresh();
+}
+
+// "Give back to Windows": the selected device leaves WinUSB
+static void cb_usb_release(...)
+{
+	GtkTreeSelection *sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(usb_list));
+	GtkTreeIter iter;
+	if (!gtk_tree_selection_get_selected(sel, NULL, &iter))
+		return;
+	gboolean ours;
+	gchar *id;
+	gtk_tree_model_get(GTK_TREE_MODEL(usb_list_model), &iter, USB_COL_OURS, &ours, USB_COL_ID, &id, -1);
+	if (ours) {
+		gtk_list_store_set(usb_list_model, &iter, USB_COL_PASS, FALSE, -1);
+		read_usb_settings();
+		std::vector<std::string> cmds(1, std::string("unbind ") + id);
+		usb_run_elevated(cmds);
+		usb_refresh();
+	}
+	g_free(id);
+}
+
+static void tb_usbuim(GtkWidget *widget)
+{
+	PrefsReplaceBool("usbuim", GTK_TOGGLE_BUTTON(widget)->active);
+}
+
+static void create_usb_pane(GtkWidget *top)
+{
+	GtkWidget *box = make_pane(top, STR_USB_PANE_TITLE);
+	make_checkbox(box, STR_USBUIM_CTRL, "usbuim", GTK_SIGNAL_FUNC(tb_usbuim));
+
+	GtkWidget *label = gtk_label_new(GetString(usb_helper_path().empty() ? STR_USB_NO_HELPER_LAB : STR_USB_HELP_LAB));
+	gtk_label_set_line_wrap(GTK_LABEL(label), TRUE);
+	gtk_misc_set_alignment(GTK_MISC(label), 0, 0.5);
+	gtk_widget_show(label);
+	gtk_box_pack_start(GTK_BOX(box), label, FALSE, FALSE, 0);
+
+	usb_list_model = gtk_list_store_new(USB_N_COLS, G_TYPE_BOOLEAN, G_TYPE_BOOLEAN,
+		G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_BOOLEAN, G_TYPE_BOOLEAN);
+	usb_list = gtk_tree_view_new_with_model(GTK_TREE_MODEL(usb_list_model));
+
+	GtkCellRenderer *renderer = gtk_cell_renderer_toggle_new();
+	g_signal_connect(renderer, "toggled", G_CALLBACK(usb_pass_toggled), NULL);
+	GtkTreeViewColumn *column = gtk_tree_view_column_new_with_attributes(GetString(STR_USB_HEADING_PASS),
+		renderer, "active", USB_COL_PASS, "activatable", USB_COL_CAN, "sensitive", USB_COL_CAN, NULL);
+	gtk_tree_view_append_column(GTK_TREE_VIEW(usb_list), column);
+	static const struct { int title, col; } text_cols[] = {
+		{STR_USB_HEADING_DEVICE, USB_COL_NAME}, {STR_USB_HEADING_ID, USB_COL_ID}, {STR_USB_HEADING_STATE, USB_COL_STATE}
+	};
+	for (int i = 0; i < 3; i++) {
+		renderer = gtk_cell_renderer_text_new();
+		column = gtk_tree_view_column_new_with_attributes(GetString(text_cols[i].title),
+			renderer, "text", text_cols[i].col, "sensitive", USB_COL_CAN, NULL);
+		gtk_tree_view_column_set_expand(column, text_cols[i].col == USB_COL_NAME);
+		gtk_tree_view_append_column(GTK_TREE_VIEW(usb_list), column);
+	}
+	gtk_widget_show(usb_list);
+
+	GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
+	gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+	gtk_scrolled_window_set_shadow_type(GTK_SCROLLED_WINDOW(scroll), GTK_SHADOW_IN);
+	gtk_widget_show(scroll);
+	gtk_container_add(GTK_CONTAINER(scroll), usb_list);
+	gtk_box_pack_start(GTK_BOX(box), scroll, TRUE, TRUE, 0);
+
+	static const opt_desc buttons[] = {
+		{STR_USB_REFRESH_CTRL, GTK_SIGNAL_FUNC(cb_usb_refresh)},
+		{STR_USB_RELEASE_CTRL, GTK_SIGNAL_FUNC(cb_usb_release)},
+		{0, NULL}
+	};
+	make_button_box(box, 0, buttons);
+
+	usb_refresh();
+}
+#endif
+
 static void read_settings(void)
 {
 	read_volumes_settings();
@@ -2209,6 +2539,9 @@ static void read_settings(void)
 	read_ethernet_settings();
 	read_memory_settings();
 	read_jit_settings();
+#ifdef SHEEPSHAVER
+	read_usb_settings();
+#endif
 }
 
 

@@ -76,6 +76,16 @@ user_string_def platform_strings[] = {
 	{STR_EXTFS_DRIVES_CTRL, "Mount drives"},
 	{STR_ETHER_FTP_PORT_LIST_CTRL, "FTP ports"},
 	{STR_ETHER_TCP_PORT_LIST_CTRL, "Server ports"},
+	{STR_USB_PANE_TITLE, "USB"},
+	{STR_USBUIM_CTRL, "Pass USB devices through to Mac OS (experimental)"},
+	{STR_USB_HELP_LAB, "Needs USB 1.4 or later in Mac OS. On Start, the devices you tick are moved to Windows' WinUSB driver (one administrator prompt), so Windows cannot use them while they are passed through. Keyboards, mice and hubs stay with Windows."},
+	{STR_USB_HEADING_PASS, "Pass through"},
+	{STR_USB_HEADING_DEVICE, "Device"},
+	{STR_USB_HEADING_ID, "ID"},
+	{STR_USB_HEADING_STATE, "Windows driver"},
+	{STR_USB_REFRESH_CTRL, "Refresh"},
+	{STR_USB_RELEASE_CTRL, "Give back to Windows"},
+	{STR_USB_NO_HELPER_LAB, "winusb-switch.exe was not found next to SheepShaver; devices are listed from the prefs only."},
 
 	{-1, NULL}	// End marker
 };
