@@ -38,6 +38,65 @@
 #include "debug.h"
 
 
+// Sound input driver (replaces the native .AppleSoundInput, traps to audio.cpp)
+static const uint8 sound_input_driver[] = {	// .AppleSoundInput driver header
+	// Driver header
+	0x4d, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x24,			// Open() offset
+	0x00, 0x28,			// Prime() offset
+	0x00, 0x2c,			// Control() offset
+	0x00, 0x38,			// Status() offset
+	0x00, 0x5e,			// Close() offset
+	0x10, 0x2e, 0x41, 0x70, 0x70, 0x6c, 0x65, 0x53, 0x6f, 0x75, 0x6e, 0x64, 0x49, 0x6e, 0x70, 0x75, 0x74, 0x00,	// ".AppleSoundInput"
+
+	// Open()
+	M68K_EMUL_OP_SOUNDIN_OPEN >> 8, M68K_EMUL_OP_SOUNDIN_OPEN & 0xff,
+	0x4e, 0x75,							//	rts
+
+	// Prime()
+	M68K_EMUL_OP_SOUNDIN_PRIME >> 8, M68K_EMUL_OP_SOUNDIN_PRIME & 0xff,
+	0x60, 0x0e,							//	bra		IOReturn
+
+	// Control()
+	M68K_EMUL_OP_SOUNDIN_CONTROL >> 8, M68K_EMUL_OP_SOUNDIN_CONTROL & 0xff,
+	0x0c, 0x68, 0x00, 0x01, 0x00, 0x1a,	//	cmp.w	#1,$1a(a0)
+	0x66, 0x04,							//	bne		IOReturn
+	0x4e, 0x75,							//	rts
+
+	// Status()
+	M68K_EMUL_OP_SOUNDIN_STATUS >> 8, M68K_EMUL_OP_SOUNDIN_STATUS & 0xff,
+
+	// IOReturn
+	0x32, 0x28, 0x00, 0x06,				//  move.w	6(a0),d1
+	0x08, 0x01, 0x00, 0x09,				//  btst		#9,d1
+	0x67, 0x0c,							//  beq		1
+	0x4a, 0x40,							//  tst.w	d0
+	0x6f, 0x02,							//  ble		2
+	0x42, 0x40,							//  clr.w	d0
+	0x31, 0x40, 0x00, 0x10,				//2 move.w	d0,$10(a0)
+	0x4e, 0x75,							//  rts
+	0x4a, 0x40,							//1 tst.w	d0
+	0x6f, 0x04,							//  ble		3
+	0x42, 0x40,							//  clr.w	d0
+	0x4e, 0x75,							//  rts
+	0x2f, 0x38, 0x08, 0xfc,				//3 move.l	$8fc,-(sp)
+	0x4e, 0x75,							//  rts
+
+	// Close()
+	M68K_EMUL_OP_SOUNDIN_CLOSE >> 8, M68K_EMUL_OP_SOUNDIN_CLOSE & 0xff,
+	0x4e, 0x75,							//	rts
+};
+
+
+// Driver resource named ".AppleSoundInput"? (name is a Pascal string at offset 18)
+static bool is_sound_input_driver(const uint8 *p, uint32 size)
+{
+	static const char name[] = ".AppleSoundInput";
+	const uint32 len = sizeof(name) - 1;
+	return size > 19 + len && p[18] == len && memcmp(p + 19, name, len) == 0;
+}
+
+
 /*
  *  Search resource for byte string, return offset (or 0)
  */
@@ -326,6 +385,18 @@ void CheckLoad(uint32 type, int16 id, uint8 *p, uint32 size)
 			p16 = (uint16 *)(p + base + 12);
 			*p16 = htons(0x7a00);	// moveq #0,d6
 			FlushCodeCache(p + base + 12, 2);
+			D(bug("  patch 1 applied\n"));
+		}
+
+	} else if (type == FOURCC('D','R','V','R') && is_sound_input_driver(p, size)) {
+		D(bug("DRVR %d (.AppleSoundInput) found, size %d\n", id, size));
+
+		// Replace the native sound input driver with one that traps to audio.cpp.
+		// Matched by name: the ID differs by machine (-16499 on Quadra/8.1,
+		// -16501/-16500 elsewhere)
+		if (size >= sizeof(sound_input_driver)) {
+			memcpy(p, sound_input_driver, sizeof(sound_input_driver));
+			FlushCodeCache(p, sizeof(sound_input_driver));
 			D(bug("  patch 1 applied\n"));
 		}
 
