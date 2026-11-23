@@ -2446,7 +2446,35 @@ static void usb_bind_on_start(void)
 		g_free(state);
 		more = gtk_tree_model_iter_next(GTK_TREE_MODEL(usb_list_model), &iter);
 	}
+	if (cmds.empty())
+		return;
 	usb_run_elevated(cmds);
+
+	// Report the devices that stayed with Windows (e.g. a USB disk still in
+	// use there): the helper refuses those
+	std::vector<std::string> lines;
+	usb_run_list(lines);
+	std::string failed;
+	for (size_t c = 0; c < cmds.size(); c++) {
+		std::string id = cmds[c].substr(5), why = "not changed";
+		for (size_t i = 0; i < lines.size(); i++) {
+			if (json_value(lines[i], "id") != id)
+				continue;
+			if (json_value(lines[i], "winusb") == "true") {
+				why.clear();
+				break;
+			}
+			std::string r = json_value(lines[i], "refuse");
+			why = r.empty() ? "still on " + json_value(lines[i], "service") : r;
+		}
+		if (!why.empty())
+			failed += "\n" + id + ": " + why;
+	}
+	if (!failed.empty()) {
+		std::string msg = "These USB devices could not be moved to WinUSB and will not be passed through:\n"
+			+ failed + "\n\nA USB disk must be ejected in Windows first.";
+		MessageBoxA(NULL, msg.c_str(), PROGRAM_NAME, MB_OK | MB_ICONWARNING);
+	}
 }
 
 static void cb_usb_refresh(...)
