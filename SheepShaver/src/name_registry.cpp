@@ -404,23 +404,12 @@ void PatchNameRegistry(void)
  *  USB UIM dispatcher (experimental gate test)
  *
  *  Called from the UIM stub's slots with the slot number and the caller's
- *  argument registers r3-r10. Every call is logged to usb.log in the working
- *  directory. With the ROM's USB 1.2.x stack (table version 4) the root hub
- *  is simulated; no real devices are attached yet.
+ *  argument registers r3-r10. With the ROM's USB 1.2.x stack (table
+ *  version 4) the root hub is simulated; no real devices are attached yet.
  */
-
-static const char *const uim_slot_names[30] = {
-	"version", "UIMInitialize", "UIMFinalize", "UIMControlEDCreate", "UIMControlTransfer",
-	NULL, NULL, "UIMBulkEDCreate", "UIMBulkTransfer", NULL,
-	NULL, "UIMInterruptEDCreate", "UIMInterruptTransfer", NULL, NULL,
-	"UIMIsocEDCreate", "UIMIsocTransfer", NULL, NULL, "UIMAbortEndpoint",
-	"UIMEDDelete", "UIMClearEndPointStall", NULL, "BusReset", "PolledDoneQueue",
-	"FrameNumber", "UIMTransactionDataRemaining", "UIMKillRemainingTransaction", "Watchdog", "Bandwidth"
-};
 
 USBHostBackend *USBHost = NULL;	// set by the host USB backend, if the build has one
 
-static FILE *usb_log = NULL;
 static uint32 uim_version = 6;		// dispatch table version of the loading USB stack
 
 // USB frame number: one full-speed frame per millisecond since start
@@ -433,18 +422,6 @@ static uint64 usb_frame_number(void)
 // Offset of ThePluginDispatchTable in the UIM's data section (= its TOC),
 // see tools/usb/mkuimstub.py
 const uint32 USB_UIM_TABLE_OFFSET = 0x80;
-
-// Describe a word: a pointer into Mac RAM gets its first 8 bytes shown
-static void usb_log_word(uint32 v)
-{
-	if (v >= RAMBase + 0x1000 && v < RAMBase + RAMSize - 8) {	// no wrap-around for 0xffffffff
-		fprintf(usb_log, " %08x[", v);
-		for (int i = 0; i < 8; i++)
-			fprintf(usb_log, "%02x", ReadMacInt8(v + i));
-		fprintf(usb_log, "]");
-	} else
-		fprintf(usb_log, " %08x", v);
-}
 
 /*
  *  Completions: a transfer's completion routine is called as
@@ -476,10 +453,6 @@ static void usb_deliver_completions(void)
 	while (!usb_done.empty()) {
 		usb_completion c = usb_done.front();
 		usb_done.pop_front();
-		if (usb_log) {
-			fprintf(usb_log, "      -> completion %08x(refcon %08x, status %d, remaining %u)\n", c.proc, c.refcon, c.status, c.remaining);
-			fflush(usb_log);
-		}
 		CallMacOS3(uint32 (*)(uint32, int32, uint32), c.proc, c.refcon, c.status, c.remaining);
 	}
 	busy = false;
@@ -558,8 +531,6 @@ static void rh_reset(void)
 			continue;
 		rh.port_status[i] |= PORT_CONNECTION | (USBHost->low_speed(i) ? PORT_LOW_SPEED : 0);
 		rh.port_change[i] |= PORT_CONNECTION;
-		if (usb_log)
-			fprintf(usb_log, "      port %d: %s\n", i + 1, USBHost->name(i));
 	}
 }
 
@@ -649,9 +620,6 @@ static void rh_setup(const uint8 *s)
 		default:			// SET_FEATURE/CLEAR_FEATURE (device, hub) and others: accept
 			break;
 	}
-	if (usb_log)
-		fprintf(usb_log, "      root hub request %02x %02x value %04x index %04x length %u -> %u bytes\n",
-			type, req, value, index, length, rh.response_len);
 }
 
 // Complete the status change interrupt transfer if a port has changed
@@ -699,8 +667,6 @@ static void rh_control_transfer(uint32 refcon, uint32 proc, uint32 buffer, uint3
 		if (rh.have_pending_address) {
 			rh.address = rh.pending_address;
 			rh.have_pending_address = false;
-			if (usb_log)
-				fprintf(usb_log, "      root hub address is now %u\n", rh.address);
 		}
 	}
 	usb_complete(proc, refcon, 0, remaining);
@@ -733,8 +699,6 @@ static void usb_dev_port_reset(int port)
 {
 	usb_devs[port].address = 0;
 	usb_devs[port].have_pending_address = false;
-	if (usb_log)
-		fprintf(usb_log, "      port %d reset: device at address 0\n", port + 1);
 }
 
 // Port whose device has this address, or -1
@@ -771,10 +735,6 @@ static void usb_dev_control_transfer(int port, uint32 refcon, uint32 proc, uint3
 			if (r < 0)
 				d.status = usb_host_status(r);
 		}
-		if (usb_log)
-			fprintf(usb_log, "      port %d request %02x %02x %02x%02x %02x%02x length %u%s\n", port + 1,
-				d.setup[0], d.setup[1], d.setup[3], d.setup[2], d.setup[5], d.setup[4], length,
-				d.status ? " -> error" : "");
 		usb_complete(proc, refcon, d.status, 0);
 		return;
 	}
@@ -786,15 +746,11 @@ static void usb_dev_control_transfer(int port, uint32 refcon, uint32 proc, uint3
 			Mac2Host_memcpy(&data[0], buffer, n);
 		int r = USBHost->control(port, d.setup, &data[0], n);
 		if (r < 0) {
-			if (usb_log)
-				fprintf(usb_log, "      port %d data stage failed (%d)\n", port + 1, r);
 			usb_complete(proc, refcon, usb_host_status(r), size);
 			return;
 		}
 		if (direction == 1)
 			Host2Mac_memcpy(buffer, &data[0], r);
-		if (usb_log)
-			fprintf(usb_log, "      port %d %s %d bytes\n", port + 1, direction == 1 ? "IN" : "OUT", r);
 		usb_complete(proc, refcon, 0, size - r);
 		return;
 	}
@@ -803,8 +759,6 @@ static void usb_dev_control_transfer(int port, uint32 refcon, uint32 proc, uint3
 	if (d.have_pending_address) {
 		d.address = d.pending_address;
 		d.have_pending_address = false;
-		if (usb_log)
-			fprintf(usb_log, "      port %d device address is now %u\n", port + 1, d.address);
 	}
 	usb_complete(proc, refcon, 0, 0);
 }
@@ -851,9 +805,6 @@ static void usb_dev_data_transfer(int type, uint32 address, uint32 endpoint, uin
 		// descriptors only) never has data: leave the transfer pending, like
 		// a device that keeps NAKing, instead of failing it (the class driver
 		// would retry at once, forever). Bulk transfers fail.
-		static int reported = 0;
-		if (usb_log && reported++ < 10)
-			fprintf(usb_log, "      port %d ep %02x: transfer not started\n", port + 1, x->ep);
 		if (type != USBHostBackend::INTERRUPT)
 			usb_complete(proc, refcon, kUSBNotRespondingErr, size);
 		delete x;
@@ -882,9 +833,6 @@ static void usb_reap_transfers(void)
 			uint32 n = result >= 0 ? result : 0;
 			if ((x->ep & 0x80) && n)
 				Host2Mac_memcpy(x->buffer, &x->data[0], n);
-			if (usb_log)
-				fprintf(usb_log, "      port %d ep %02x: %s %u of %u bytes, status %d\n", x->port + 1, x->ep,
-					(x->ep & 0x80) ? "IN" : "OUT", n, x->size, status);
 			usb_complete(x->proc, x->refcon, status, x->size - n);
 			delete x;
 			break;
@@ -914,13 +862,6 @@ static void usb_hotplug(void)
 		usb_devs[i].have_pending_address = false;
 		if (rh.reset_port == i)
 			rh.reset_port = -1;
-		if (usb_log) {
-			if (USBHost->present(i))
-				fprintf(usb_log, "      port %d: %s plugged in\n", i + 1, USBHost->name(i));
-			else
-				fprintf(usb_log, "      port %d: unplugged\n", i + 1);
-			fflush(usb_log);
-		}
 	}
 	rh_check_status_change();
 }
@@ -949,23 +890,6 @@ uint32 USBUIMResult2 = 0;		// r4 on return (64-bit results)
 
 uint32 USBUIMCall(uint32 slot, uint32 toc, uint32 ret, uint32 a1, uint32 a2, uint32 a3, uint32 a4, uint32 a5, uint32 a6, uint32 a7, uint32 a8)
 {
-	static unsigned long calls = 0;
-	if (usb_log == NULL)
-		usb_log = fopen("usb.log", "w");
-	static unsigned long frame_calls = 0;
-	// frame number and the v6 idle call are polled constantly
-	static unsigned long idle_calls = 0;
-	bool quiet = (slot == 25 && ++frame_calls > 3) || (slot == 28 && ++idle_calls > 3);
-	if (usb_log && calls < 5000 && !quiet) {
-		const char *name = slot < 30 && uim_slot_names[slot] ? uim_slot_names[slot] : "?";
-		fprintf(usb_log, "%5lu slot %2u %-28s", ++calls, slot, name);
-		const uint32 a[8] = {a1, a2, a3, a4, a5, a6, a7, a8};
-		for (int i = 0; i < 8; i++)
-			usb_log_word(a[i]);
-		fprintf(usb_log, "\n");
-		fflush(usb_log);
-	}
-
 	// Polling calls from the USB stack deliver finished transfers
 	if (slot == 22 || slot == 24 || slot == 25 || (slot == 28 && uim_version == 6)) {
 		usb_hotplug();
@@ -996,12 +920,6 @@ uint32 USBUIMCall(uint32 slot, uint32 toc, uint32 ret, uint32 a1, uint32 a2, uin
 					WriteMacInt16(rts_proc, 0x4e75);	// rts
 				}
 				WriteMacInt32(em + 0x294, rts_proc);
-				if (usb_log)
-					fprintf(usb_log, "      ExpandMem+0x294 was NULL, set to RTS at %08x\n", rts_proc);
-			}
-			if (usb_log) {
-				fprintf(usb_log, "      table at %08x set to version %u (caller %08x)\n", toc + USB_UIM_TABLE_OFFSET, version, ret);
-				fflush(usb_log);
 			}
 			return 0;
 		}
@@ -1057,8 +975,6 @@ uint32 USBUIMCall(uint32 slot, uint32 toc, uint32 ret, uint32 a1, uint32 a2, uin
 				rh.int_proc = a4;
 				rh.int_buffer = a5;
 				rh.int_size = a7;
-				if (usb_log)
-					fprintf(usb_log, "      root hub status change transfer pending (%u bytes)\n", a7);
 				rh_check_status_change();
 			}
 			return 0;
