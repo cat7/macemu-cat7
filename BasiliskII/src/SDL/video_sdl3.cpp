@@ -713,6 +713,21 @@ static float get_mag_rate()
 	return m < 1 ? 1 : m > 4 ? 4 : m;
 }
 
+// Window size per Mac pixel: the "mag_rate" pref, and on Windows also the
+// display scale (e.g. 1.5 at 150%). SDL3 makes the process DPI aware there and
+// sizes windows in physical pixels, so without it the window would not follow
+// the Windows display setting.
+static float get_window_scale()
+{
+	float m = get_mag_rate();
+#ifdef WIN32
+	float s = sdl_window ? SDL_GetWindowDisplayScale(sdl_window) : SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
+	if (s > 0)
+		m *= s;
+#endif
+	return m;
+}
+
 static SDL_Surface *init_sdl_video(int width, int height, int depth, Uint32 flags, int pitch)
 {
     if (guest_surface) {
@@ -729,14 +744,17 @@ static SDL_Surface *init_sdl_video(int width, int height, int depth, Uint32 flag
 		window_width = sdl_display_width();
 		window_height = sdl_display_height();
 	}
-	
+	// Fullscreen sizes are already in display pixels
+	const float m = (flags & SDL_WINDOW_FULLSCREEN) ? get_mag_rate() : get_window_scale();
+	window_width = (int)(m * window_width);
+	window_height = (int)(m * window_height);
+
 	if (sdl_window) {
 		int old_window_width, old_window_height, old_window_flags;
 		SDL_GetWindowSize(sdl_window, &old_window_width, &old_window_height);
 		old_window_flags = SDL_GetWindowFlags(sdl_window);
-		float m = get_mag_rate();
-		if (old_window_width != m * window_width ||
-			old_window_height != m * window_height ||
+		if (old_window_width != window_width ||
+			old_window_height != window_height ||
 			(old_window_flags & window_flags_to_monitor) != (window_flags & window_flags_to_monitor))
 		{
 			delete_sdl_video_window();
@@ -748,7 +766,6 @@ static SDL_Surface *init_sdl_video(int width, int height, int depth, Uint32 flag
 #endif
 	
 	if (!sdl_window) {
-		float m = get_mag_rate();
 #ifdef VIDEO_CHROMAKEY
 		if (display_type == DISPLAY_CHROMAKEY) {
 			window_flags |= SDL_WINDOW_BORDERLESS | SDL_WINDOW_TRANSPARENT;
@@ -757,8 +774,8 @@ static SDL_Surface *init_sdl_video(int width, int height, int depth, Uint32 flag
 #endif
 		sdl_window = SDL_CreateWindow(
 			"",
-			m * window_width,
-			m * window_height,
+			window_width,
+			window_height,
 			window_flags);
 		if (!sdl_window) {
 			shutdown_sdl_video();
@@ -766,6 +783,14 @@ static SDL_Surface *init_sdl_video(int width, int height, int depth, Uint32 flag
 		}
 		SDL_SyncWindow(sdl_window); // needed for fullscreen
 		set_window_name();
+#ifdef WIN32
+		// Windows only lets the foreground process activate a window. When
+		// started from the GUI (which closes first, maybe after a UAC prompt)
+		// we are not it, and the window would open behind other windows.
+		SDL_SetHint(SDL_HINT_FORCE_RAISEWINDOW, "1");
+		SDL_RaiseWindow(sdl_window);
+		SDL_SetHint(SDL_HINT_FORCE_RAISEWINDOW, "0");
+#endif
 	}
 	
 	// Some SDL events (regarding some native-window events), need processing
@@ -877,8 +902,16 @@ static SDL_Surface *init_sdl_video(int width, int height, int depth, Uint32 flag
 		shutdown_sdl_video();
 		return NULL;
 	}
-	if (PrefsFindBool("scale_nearest"))
+	if (PrefsFindBool("scale_nearest")) {
+		// Pixel art mode looks like nearest neighbor but keeps the pixels even
+		// at non-integer scales (e.g. 150% Windows display scaling). Renderers
+		// without it (direct3d, software) fall back to nearest neighbor.
+#if SDL_VERSION_ATLEAST(3, 4, 0)
+		SDL_SetTextureScaleMode(sdl_texture, SDL_SCALEMODE_PIXELART);
+#else
 		SDL_SetTextureScaleMode(sdl_texture, SDL_SCALEMODE_NEAREST);
+#endif
+	}
 
     return guest_surface;
 }
@@ -1681,7 +1714,7 @@ static void do_toggle_fullscreen(void)
 			display_type = DISPLAY_WINDOW;
 			SDL_SetWindowFullscreen(sdl_window, false);
 			const VIDEO_MODE &mode = drv->mode;
-			float m = get_mag_rate();
+			float m = get_window_scale();
 			SDL_SetWindowSize(sdl_window, m * VIDEO_MODE_X, m * VIDEO_MODE_Y);
 #ifndef SDL_PLATFORM_MACOS
 			SDL_SetWindowPosition(sdl_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
@@ -1989,7 +2022,7 @@ static bool is_cursor_in_mac_screen()
 		deltaY = (int)cursorY - windowY;
 		D(bug("cursor relative {%d,%d}\n", deltaX, deltaY));
 		const VIDEO_MODE &mode = drv->mode;
-		float m = get_mag_rate();
+		float m = get_window_scale();
 		out = deltaX >= 0 && deltaX < VIDEO_MODE_X * m &&
 				deltaY >= 0 && deltaY < VIDEO_MODE_Y * m;
 		D(bug("cursor in window? %s\n", out? "yes" : "no"));
