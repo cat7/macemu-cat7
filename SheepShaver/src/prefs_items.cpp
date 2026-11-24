@@ -51,7 +51,7 @@ prefs_desc common_prefs_items[] = {
 	{"nocdrom", TYPE_BOOLEAN, false,    "don't install CD-ROM driver"},
 	{"nonet", TYPE_BOOLEAN, false,      "don't use Ethernet"},
 	{"nosound", TYPE_BOOLEAN, false,    "don't enable sound output"},
-	{"usbuim", TYPE_BOOLEAN, false,     "install the experimental USB UIM (logs to usb.log)"},
+	{"usbuim", TYPE_BOOLEAN, false,     "install the experimental USB UIM"},
 	{"usbdevice", TYPE_STRING, true,    "host USB device to pass through, VVVV:PPPP (needs usbuim)"},
 	{"nogui", TYPE_BOOLEAN, false,      "disable GUI"},
 	{"noclipconversion", TYPE_BOOLEAN, false, "don't convert clipboard contents"},
