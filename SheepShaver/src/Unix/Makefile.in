@@ -64,7 +64,7 @@ DYNGENSRCS += $(filter %i386-dis.c,$(MONSRCS))
 endif
 
 ## Files
-SRCS = ../main.cpp main_unix.cpp ../prefs.cpp ../prefs_items.cpp prefs_unix.cpp sys_unix.cpp \
+SRCS = ../main.cpp main_unix.cpp ../prefs.cpp ../prefs_items.cpp prefs_unix.cpp sys_unix.cpp ../usb_libusb.cpp \
     ../rom_patches.cpp ../rsrc_patches.cpp ../emul_op.cpp ../name_registry.cpp \
     ../macos_util.cpp ../timer.cpp timer_unix.cpp ../xpram.cpp xpram_unix.cpp \
     ../adb.cpp ../sony.cpp ../disk.cpp ../cdrom.cpp ../scsi.cpp \
@@ -133,7 +133,8 @@ $(GUI_APP_EXE): $(OBJ_DIR) $(GUI_OBJS)
 $(APP)_app: $(APP) ../MacOSX/Info.plist ../MacOSX/$(APP).icns
 	rm -rf $(APP_APP)/Contents
 	mkdir -p $(APP_APP)/Contents
-	./cpr.sh ../MacOSX/Info.plist $(APP_APP)/Contents/
+	# Xcode fills in the bundle identifier; use the one its project sets
+	sed -e 's/$$(PRODUCT_BUNDLE_IDENTIFIER)/net.cebix.sheepshaver/' < ../MacOSX/Info.plist > $(APP_APP)/Contents/Info.plist
 	echo -n 'APPL????' > $(APP_APP)/Contents/PkgInfo
 	mkdir -p $(APP_APP)/Contents/MacOS
 	./cpr.sh $(APP) $(APP_APP)/Contents/MacOS/
@@ -142,6 +143,8 @@ $(APP)_app: $(APP) ../MacOSX/Info.plist ../MacOSX/$(APP).icns
 	mkdir -p $(APP_APP)/Contents/Resources/English.lproj
 	./cpr.sh ../MacOSX/Launcher/English.lproj/VMSettingsWindow.nib $(APP_APP)/Contents/Resources/English.lproj
 	./cpr.sh ../MacOSX/SheepShaver.icns $(APP_APP)/Contents/Resources/
+	# strip -x broke the linker's signature; arm64 macOS runs only signed code
+	codesign --force -s - $(APP_APP)
 
 $(GUI_APP)_app: $(GUI_APP) ../MacOSX/Info.plist ../MacOSX/$(APP).icns
 	rm -rf $(GUI_APP_APP)/Contents

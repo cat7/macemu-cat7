@@ -54,6 +54,9 @@ AC_ARG_WITH(bincue,
 AC_ARG_WITH(libvhd,   
   AS_HELP_STRING([--with-libvhd], [Enable VHD disk images]))
 
+AC_ARG_WITH(libusb,
+  AS_HELP_STRING([--with-libusb], [pass host USB devices through with libusb-1.0 [default=auto]]))
+
 
 dnl Addressing mode
 AC_ARG_ENABLE(addressing,
@@ -730,6 +733,19 @@ AS_IF([test  "x$have_bincue" = "xyes" ], [
        AC_SUBST(USE_BINCUE, yes)
    fi
 ], [AC_SUBST(USE_BINCUE, no)])
+
+dnl libusb (optional): pass host USB devices through to the Mac
+have_libusb=no
+AS_IF([test "x$with_libusb" != "xno"], [
+  PKG_CHECK_MODULES([LIBUSB], [libusb-1.0], [
+    CPPFLAGS="$CPPFLAGS $LIBUSB_CFLAGS"
+    LIBS="$LIBS $LIBUSB_LIBS"
+    have_libusb=yes
+    AC_DEFINE(HAVE_LIBUSB, 1, [Define to pass host USB devices through with libusb])
+  ], [
+    AS_IF([test "x$with_libusb" = "xyes"], [AC_MSG_ERROR([libusb-1.0 not found])])
+  ])
+])
 
 dnl LIBVHD
 AS_IF([test  "x$with_libvhd" = "xyes" ], [have_libvhd=yes], [have_libvhd=no])
@@ -1776,6 +1792,7 @@ echo
 echo SDL support ...................... : $SDL_SUPPORT
 echo SDL major-version ................ : $WANT_SDL_VERSION_MAJOR
 echo BINCUE support ................... : $have_bincue
+echo USB passthrough via libusb ....... : $have_libusb
 echo LIBVHD support ................... : $have_libvhd
 echo VDE support ...................... : $have_vdeplug
 echo FBDev DGA support ................ : $WANT_FBDEV_DGA

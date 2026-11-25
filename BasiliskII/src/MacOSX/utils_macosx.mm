@@ -20,7 +20,11 @@
 
 #include <Cocoa/Cocoa.h>
 #include "sysdeps.h"
+#ifdef USE_SDL3
+#include <SDL3/SDL.h>
+#else
 #include <SDL.h>
+#endif
 #include "utils_macosx.h"
 
 #if SDL_VERSION_ATLEAST(2, 0, 0) && !SDL_VERSION_ATLEAST(3, 0, 0)

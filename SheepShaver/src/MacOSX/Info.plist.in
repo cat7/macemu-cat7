@@ -43,5 +43,7 @@
 	<string>10.7.0</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>SheepShaver passes the microphone to Mac OS as its sound input.</string>
 </dict>
 </plist>
