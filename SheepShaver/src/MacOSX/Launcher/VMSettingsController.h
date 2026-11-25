@@ -65,6 +65,11 @@
     IBOutlet NSTextField *modemPort;
     IBOutlet NSTextField *printerPort;
     IBOutlet NSTextField *ethernetInterface;
+    // USB (built in code, see addUSBTab)
+    NSButton *usbEnable;
+    NSTableView *usbTable;
+    NSTextField *usbNote;
+    NSMutableArray *usbDevices;		// NSMutableDictionary per row
 }
 
 + (id) sharedInstance;
@@ -79,6 +84,7 @@
 - (IBAction) browseForROMFileClicked: (id) sender;
 - (IBAction) browseForUnixRootClicked: (id) sender;
 - (IBAction) browseForKeyCodesFileClicked: (id) sender;
+- (IBAction) refreshUSBClicked: (id) sender;
 - (void) cancelEdit: (id) sender;
 - (void) saveChanges: (id) sender;
 - (BOOL) cancelWasClicked;
