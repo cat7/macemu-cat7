@@ -517,6 +517,18 @@ static struct {
 
 static void usb_dev_port_reset(int port);
 
+// Passed-through devices are connected only for the USB stack of the "USB
+// Support" extension (table version 6). The ROM's USB 1.2.x stack (version
+// 4) runs before the Toolbox is up: for a device it has no driver for (a
+// webcam, an audio device) it puts up its "software needed ... cannot be
+// found" notice, which ends in an unimplemented trap before the icon
+// parade. Until version 6 the host side is not even started, so the
+// devices stay with the host while Mac OS starts up.
+static USBHostBackend *usb_host(void)
+{
+	return uim_version >= 6 ? USBHost : NULL;
+}
+
 static void rh_reset(void)
 {
 	memset(&rh, 0, sizeof(rh));
@@ -525,11 +537,12 @@ static void rh_reset(void)
 		rh.port_status[i] = PORT_POWER;
 
 	// Passed-through host devices: one port each, connected if plugged in
-	int n = USBHost ? USBHost->count() : 0;
+	USBHostBackend *host = usb_host();
+	int n = host ? host->count() : 0;
 	for (int i = 0; i < n && i < RH_PORTS; i++) {
-		if (!USBHost->present(i))
+		if (!host->present(i))
 			continue;
-		rh.port_status[i] |= PORT_CONNECTION | (USBHost->low_speed(i) ? PORT_LOW_SPEED : 0);
+		rh.port_status[i] |= PORT_CONNECTION | (host->low_speed(i) ? PORT_LOW_SPEED : 0);
 		rh.port_change[i] |= PORT_CONNECTION;
 	}
 }
@@ -845,7 +858,7 @@ static void usb_reap_transfers(void)
 // changes; Mac OS's hub driver then enumerates or removes them
 static void usb_hotplug(void)
 {
-	if (USBHost == NULL)
+	if (usb_host() == NULL)
 		return;
 	uint32 mask = USBHost->changes();
 	if (mask == 0)
