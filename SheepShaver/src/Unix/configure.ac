@@ -817,7 +817,7 @@ if [[ "x$WANT_SDL_VIDEO" = "xyes" ]]; then
     else
       EXTRASYSSRCS="$EXTRASYSSRCS ../MacOSX/clip_macosx.cpp"
     fi
-    EXTRASYSSRCS="$EXTRASYSSRCS ../MacOSX/utils_macosx.mm"
+    EXTRASYSSRCS="$EXTRASYSSRCS ../MacOSX/utils_macosx.mm ../MacOSX/usb_elevate_macosx.mm"
     CPPFLAGS="$CPPFLAGS -I../MacOSX"
   else
     EXTRASYSSRCS="$EXTRASYSSRCS ../dummy/clip_dummy.cpp"

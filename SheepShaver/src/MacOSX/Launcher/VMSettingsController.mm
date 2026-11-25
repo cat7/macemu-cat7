@@ -409,8 +409,8 @@ static NSTableColumn *makeColumn(NSString *ident, NSString *title, CGFloat width
   if (hidden)
     [notes addObject:[NSString stringWithFormat:@"%d device%s hidden.", hidden, hidden == 1 ? "" : "s"]];
   if (geteuid() != 0)
-    [notes addObject:@"SheepShaver is not running as root: devices that macOS has drivers for "
-                     @"(disks, audio, HID) stay with macOS. Start it with sudo to pass those through."];
+    [notes addObject:@"Devices that macOS has drivers for (disks, cameras, audio) need root: "
+                     @"SheepShaver asks for an administrator password at start when one of them is plugged in."];
   [usbNote setStringValue:[notes componentsJoinedByString:@" "]];
 }
 

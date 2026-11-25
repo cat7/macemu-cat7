@@ -138,6 +138,11 @@
 #include "utils_macosx.h"
 #endif
 
+#if defined(__APPLE__) && defined(HAVE_LIBUSB)
+#include <vector>
+#include "usb_elevate_macosx.h"
+#endif
+
 #ifdef ENABLE_GTK
 #include <gtk/gtk.h>
 #include <gdk/gdk.h>
@@ -798,9 +803,19 @@ int main(int argc, char **argv)
 	bool memory_mapped_from_zero, ram_rom_areas_contiguous;
 	const char *vmdir = NULL;
 
+#if defined(__APPLE__) && defined(HAVE_LIBUSB)
+	// Started as sudo's password prompt (see usb_elevate_macosx.mm)?
+	USBAskpassMainIfRequested();
+#endif
+
 	// Initialize variables
 	RAMBase = 0;
 	tzset();
+
+#if defined(__APPLE__) && defined(HAVE_LIBUSB)
+	// The arguments as given, for a restart as root (PrefsInit() takes some out)
+	std::vector<std::string> original_args(argv, argv + argc);
+#endif
 
 	// Print some info
 	printf(GetString(STR_ABOUT_TEXT1), VERSION_MAJOR, VERSION_MINOR);
@@ -918,6 +933,23 @@ int main(int argc, char **argv)
 
 	// Read preferences
 	PrefsInit(vmdir, argc, argv);
+
+#if defined(__APPLE__) && defined(HAVE_LIBUSB)
+	// USB passthrough: macOS hands devices with a macOS driver only to root
+	if (USBRelaunchAsRootIfNeeded(original_args)) {
+		PrefsExit();
+		return 0;
+	}
+	{
+		extern std::string UserPrefsPath;
+		const char *home = getenv("HOME");
+		std::string h = home ? home : "";
+		std::vector<std::string> files;
+		files.push_back(vmdir ? std::string(vmdir) + "/prefs" : !UserPrefsPath.empty() ? UserPrefsPath : h + "/.sheepshaver_prefs");
+		files.push_back(vmdir ? std::string(vmdir) + "/nvram" : h + "/.sheepshaver_nvram");
+		USBElevatedOwnFiles(files);
+	}
+#endif
 	// Only use nogui preference if not passed as command line argument
 	if (use_gui == -1)
 		use_gui = !PrefsFindBool("nogui");
