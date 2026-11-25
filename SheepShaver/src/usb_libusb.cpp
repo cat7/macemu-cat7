@@ -25,6 +25,11 @@
  *  gets its real device and configuration descriptors, which the host has
  *  cached, and simple requests are accepted, so it can be enumerated
  *  without changing its host driver.
+ *
+ *  Where the host has its own drivers on a device's interfaces (macOS,
+ *  Linux), they are detached when the device is opened and attached again
+ *  when the emulator quits, as QEMU's usb-host does. On macOS that needs
+ *  root; without it the interfaces stay with macOS.
  */
 
 #include "sysdeps.h"
@@ -69,6 +74,7 @@ private:
 		libusb_device_handle *handle;	// NULL: descriptors only
 		bool low_speed;
 		bool high_speed;			// faster than the Mac's USB 1.1 bus
+		std::vector<int> detached;	// interfaces taken from a host driver
 		std::string label;
 	};
 
@@ -76,6 +82,8 @@ private:
 	bool valid(int dev) { return dev >= 0 && dev < (int)devs.size(); }
 	void attach(int slot, libusb_device *dev);
 	void detach(int slot);
+	void detach_host_drivers(Device &d);
+	void attach_host_drivers(Device &d);
 	void scan(void);
 	int cached_request(Device &d, const uint8 *setup, uint8 *data, int length);
 	static int config_bytes(libusb_device *dev, int index, std::vector<uint8> &out);
@@ -122,6 +130,10 @@ private:
 
 LibUSBHost::~LibUSBHost()
 {
+	// Give the host back the interfaces we took from its drivers
+	for (size_t i = 0; i < devs.size(); i++)
+		if (devs[i].present && devs[i].handle)
+			attach_host_drivers(devs[i]);
 	if (events.joinable()) {
 		quit = true;
 		events.detach();		// at exit: do not wait for libusb
@@ -177,14 +189,51 @@ void LibUSBHost::attach(int slot, libusb_device *dev)
 	int speed = libusb_get_device_speed(dev);
 	d.low_speed = speed == LIBUSB_SPEED_LOW;
 	d.high_speed = speed >= LIBUSB_SPEED_HIGH;
+	d.detached.clear();
 	if (libusb_open(dev, &d.handle) != 0)
 		d.handle = NULL;
+	else
+		detach_host_drivers(d);
 	char buf[64];
 	snprintf(buf, sizeof(buf), "%04x:%04x %s%s", d.vid, d.pid,
 	         d.low_speed ? "low speed" : d.high_speed ? "high speed" : "full speed",
 	         d.handle ? "" : ", descriptors only");
 	d.label = buf;
 	d.present = true;
+}
+
+// Take the device's interfaces from the host's drivers, so that they can be
+// claimed. Hosts without such drivers (Windows: WinUSB) report
+// LIBUSB_ERROR_NOT_SUPPORTED, and nothing happens.
+void LibUSBHost::detach_host_drivers(Device &d)
+{
+	libusb_config_descriptor *cd;
+	if (libusb_get_active_config_descriptor(d.dev, &cd) != 0 &&
+	    libusb_get_config_descriptor(d.dev, 0, &cd) != 0)
+		return;
+	for (int i = 0; i < cd->bNumInterfaces; i++) {
+		int n = cd->interface[i].altsetting[0].bInterfaceNumber;
+		if (libusb_kernel_driver_active(d.handle, n) != 1)
+			continue;
+		int err = libusb_detach_kernel_driver(d.handle, n);
+		if (err == 0)
+			d.detached.push_back(n);
+		else
+			fprintf(stderr, "USB %04x:%04x: cannot take interface %d from the host driver (%s)%s\n",
+			        d.vid, d.pid, n, libusb_error_name(err),
+			        err == LIBUSB_ERROR_ACCESS ? ", run as root" : "");
+	}
+	libusb_free_config_descriptor(cd);
+}
+
+// Hand the interfaces we took back to the host's drivers
+void LibUSBHost::attach_host_drivers(Device &d)
+{
+	for (size_t i = 0; i < d.detached.size(); i++) {
+		libusb_release_interface(d.handle, d.detached[i]);
+		libusb_attach_kernel_driver(d.handle, d.detached[i]);
+	}
+	d.detached.clear();
 }
 
 // Unplug a slot's device: its transfers are cancelled, and its handle is
@@ -209,6 +258,7 @@ void LibUSBHost::detach(int slot)
 		libusb_unref_device(d.dev);
 	d.dev = NULL;
 	d.handle = NULL;
+	d.detached.clear();
 	d.present = false;
 }
 
