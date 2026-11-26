@@ -586,6 +586,14 @@ static const uint32 soundin_rates[] = {
 };
 static const int NUM_SOUNDIN_RATES = sizeof(soundin_rates) / sizeof(soundin_rates[0]);
 
+// Input sources, numbered from 1 (siInputSource) and as OSTypes
+// (siOSTypeInputSource), in the order of siInputSourceNames
+static const uint32 soundin_source_types[] = {
+	FOURCC('i','m','i','c'),	// kIntMicSource
+	FOURCC('c','d',' ',' ')		// kCDSource
+};
+static const int NUM_SOUNDIN_SOURCES = sizeof(soundin_source_types) / sizeof(soundin_source_types[0]);
+
 static struct {
 	// Driver settings
 	uint32 sample_rate;			// 16.16 fixed
@@ -976,10 +984,20 @@ int16 SoundInControl(uint32 pb, uint32 dce)
 
 		case siInputSource: {
 			int16 s = ReadMacInt16(data);
-			if (s < 1 || s > 2)
+			if (s < 1 || s > NUM_SOUNDIN_SOURCES)
 				return paramErr;
-			si.source = s;		// both sources record from the host default device
+			si.source = s;		// all sources record from the host default device
 			return noErr;
+		}
+
+		case siOSTypeInputSource: {
+			uint32 type = ReadMacInt32(data);
+			for (int i = 0; i < NUM_SOUNDIN_SOURCES; i++)
+				if (soundin_source_types[i] == type) {
+					si.source = i + 1;
+					return noErr;
+				}
+			return paramErr;
 		}
 
 		case siPlayThruOnOff:
@@ -1165,12 +1183,26 @@ int16 SoundInStatus(uint32 pb, uint32 dce)
 			status_int32(pb, si.gain);
 			return noErr;
 
-		case siInputAvailable:
-			status_int16(pb, 2);
+		case siInputAvailable: {
+			// The same selector as siOSTypeInputAvailable: answer with a
+			// SoundInfoList (count, handle to the sources' OSTypes) like
+			// Apple Audio Extension's driver; the count alone is its first
+			// field, for callers that ask for the number of sources
+			uint32 h = new_handle(NUM_SOUNDIN_SOURCES * 4);
+			if (h == 0)
+				return memFullErr;
+			for (int i = 0; i < NUM_SOUNDIN_SOURCES; i++)
+				WriteMacInt32(ReadMacInt32(h) + i * 4, soundin_source_types[i]);
+			status_count_handle(pb, NUM_SOUNDIN_SOURCES, h);
 			return noErr;
+		}
 
 		case siInputSource:
 			status_int16(pb, si.source);
+			return noErr;
+
+		case siOSTypeInputSource:	// Apple Audio Extension 1.0.4 asks for this
+			status_int32(pb, soundin_source_types[si.source - 1]);
 			return noErr;
 
 		case siInputSourceNames: {	// handle to 'STR#' data
